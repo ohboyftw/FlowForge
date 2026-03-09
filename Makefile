@@ -1,10 +1,13 @@
-.PHONY: install test lint format examples clean
+.PHONY: install test smoke lint format examples clean
 
 install:
 	pip install -e ".[dev]"
 
 test:
 	python -m pytest tests/ -v
+
+smoke:
+	python -m pytest tests/test_smoke.py -v
 
 test-cov:
 	python -m pytest tests/ -v --cov=flowforge --cov-report=term-missing

@@ -1,7 +1,7 @@
 # FlowForge — Scaffold & Advance Plan
 
 Created: 2026-03-09
-Status: Ready for execution
+Status: Complete (Phase A + B)
 
 ## Context
 
@@ -11,14 +11,14 @@ Source has been extracted from `flowforge-project.tar.gz` into the project root.
 
 ## Phase A — Scaffold (get to runnable state)
 
-- [ ] **A1**: Initialize git repo — `git init && git add -A && git commit -m "feat: initial FlowForge scaffold from archive"`
-- [ ] **A2**: Create `.env.example` with placeholder LLM API keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY)
-- [ ] **A3**: Install dev dependencies — `pip install -e ".[dev]"` or `uv pip install -e ".[dev]"`
-- [ ] **A4**: Run `py -m pytest tests/ -v` and confirm all tests pass
-- [ ] **A5**: Run `ruff check src/ tests/` and `ruff format --check src/ tests/` — fix any lint issues
-- [ ] **A6**: Verify `py -c "from flowforge import Unit, Flow, Agent, Team; print('OK')"` works
-- [ ] **A7**: Clean up duplicate files from pre-extraction (`flowforge-CLAUDE.md`, `flowforge-README.md`, `flowforge-pyproject.toml`) — remove if content matches extracted versions
-- [ ] **A8**: Commit clean state — `git add -A && git commit -m "chore: clean scaffold, all tests passing"`
+- [x] **A1**: Initialize git repo — `git init && git add -A && git commit -m "feat: initial FlowForge scaffold from archive"`
+- [x] **A2**: Create `.env.example` with placeholder LLM API keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY)
+- [x] **A3**: Install dev dependencies — `pip install -e ".[dev]"` or `uv pip install -e ".[dev]"`
+- [x] **A4**: Run `py -m pytest tests/ -v` and confirm all tests pass
+- [x] **A5**: Run `ruff check src/ tests/` and `ruff format --check src/ tests/` — fix any lint issues
+- [x] **A6**: Verify `py -c "from flowforge import Unit, Flow, Agent, Team; print('OK')"` works
+- [x] **A7**: Clean up duplicate files from pre-extraction (`flowforge-CLAUDE.md`, `flowforge-README.md`, `flowforge-pyproject.toml`) — remove if content matches extracted versions
+- [x] **A8**: Commit clean state — `git add -A && git commit -m "chore: clean scaffold, all tests passing"`
 
 ### Definition of Done (Phase A)
 - Git repo initialized with clean history
@@ -29,12 +29,12 @@ Source has been extracted from `flowforge-project.tar.gz` into the project root.
 
 ## Phase B — Advance (one meaningful step)
 
-- [ ] **B1**: Read all 5 examples in `examples/` — verify each runs without error (mock LLM mode)
-- [ ] **B2**: Add a real LLM integration smoke test using `litellm` — test with a cheap model (e.g., `claude-haiku-4-5-20251001`) if API key available, otherwise mock
-- [ ] **B3**: Add a `Makefile` target `make smoke` that runs the smoke test
-- [ ] **B4**: Verify `Team` with `strategy="parallel"` works correctly (concurrent agent execution)
-- [ ] **B5**: Add `py.typed` marker file to `src/flowforge/` for PEP 561 compliance
-- [ ] **B6**: Commit — `git add -A && git commit -m "feat: verified examples, added smoke test"`
+- [x] **B1**: Read all 5 examples in `examples/` — verify each runs without error (mock LLM mode)
+- [x] **B2**: Add a real LLM integration smoke test using `litellm` — test with a cheap model (e.g., `claude-haiku-4-5-20251001`) if API key available, otherwise mock
+- [x] **B3**: Add a `Makefile` target `make smoke` that runs the smoke test
+- [x] **B4**: Verify `Team` with `strategy="parallel"` works correctly (concurrent agent execution)
+- [x] **B5**: Add `py.typed` marker file to `src/flowforge/` for PEP 561 compliance
+- [x] **B6**: Commit — `git add -A && git commit -m "feat: verified examples, added smoke test"`
 
 ### Definition of Done (Phase B)
 - All examples run without error
