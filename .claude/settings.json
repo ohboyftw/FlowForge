@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python*)",
+      "Bash(pip*)",
+      "Bash(pytest*)",
+      "Bash(ruff*)",
+      "Bash(git*)",
+      "Bash(cat*)",
+      "Bash(ls*)",
+      "Bash(find*)",
+      "Bash(wc*)",
+      "Bash(grep*)",
+      "Read(*)",
+      "Write(src/**)",
+      "Write(tests/**)",
+      "Write(examples/**)",
+      "Write(README.md)",
+      "Write(CLAUDE.md)",
+      "Write(pyproject.toml)"
+    ],
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(sudo*)"
+    ]
+  }
+}
