@@ -12,7 +12,9 @@ Design: Store is a Pydantic BaseModel subclass, giving us:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import (
@@ -50,6 +52,10 @@ class StoreBase(BaseModel):
         arbitrary_types_allowed=True,
         extra="forbid",  # catch typos — no surprise fields
     )
+
+    # ── Reducer declarations for parallel fan-in ──
+    # Usage: __reducers__ = {"findings": "extend", "score": lambda old, new: max(old, new)}
+    __reducers__: ClassVar[dict[str, str | Callable]] = {}
 
     # ── Internal metadata (excluded from schema/serialization) ──
     _checkpoints: dict[str, dict] = {}
@@ -198,14 +204,29 @@ class ReducerRegistry:
     def __init__(self, field_reducers: dict[str, str | Callable] = None):
         self._reducers: dict[str, Callable] = {}
         for field_name, reducer in (field_reducers or {}).items():
-            if isinstance(reducer, str):
-                if reducer not in self._builtins:
-                    raise ValueError(
-                        f"Unknown reducer '{reducer}'. Available: {list(self._builtins.keys())}"
-                    )
-                self._reducers[field_name] = self._builtins[reducer]
-            else:
-                self._reducers[field_name] = reducer
+            self._register(field_name, reducer)
+
+    def _register(self, field_name: str, reducer: str | Callable) -> None:
+        if isinstance(reducer, str):
+            if reducer not in self._builtins:
+                raise ValueError(
+                    f"Unknown reducer '{reducer}'. Available: {list(self._builtins.keys())}"
+                )
+            self._reducers[field_name] = self._builtins[reducer]
+        else:
+            self._reducers[field_name] = reducer
+
+    @classmethod
+    def from_store_class(cls, store_cls: type[StoreBase]) -> ReducerRegistry:
+        """Build a ReducerRegistry from a StoreBase subclass's __reducers__ ClassVar."""
+        reducers = getattr(store_cls, "__reducers__", {})
+        return cls(reducers)
+
+    def merge(self, other: ReducerRegistry) -> ReducerRegistry:
+        """Return a new registry combining self and other (other wins on conflicts)."""
+        combined = ReducerRegistry()
+        combined._reducers = {**self._reducers, **other._reducers}
+        return combined
 
     def reduce(self, store: StoreBase, field_name: str, old_val: Any, new_val: Any) -> Any:
         reducer = self._reducers.get(field_name, self._builtins["replace"])
@@ -238,6 +259,8 @@ class Unit(Generic[S]):
                 return "default"
     """
 
+    max_retries: int = 0
+
     def prep(self, store: S) -> Any:
         """Extract what you need from state. Return prep context."""
         return None
@@ -246,6 +269,10 @@ class Unit(Generic[S]):
         """Pure computation. No store access — keeps it testable."""
         return prep_result
 
+    def exec_fallback(self, prep_result: Any, error: Exception) -> Any:
+        """Called after max_retries exhausted. Default: re-raise."""
+        raise error
+
     def post(self, store: S, exec_result: Any) -> str:
         """Write results to store. Return action label for routing."""
         return "default"
@@ -253,8 +280,57 @@ class Unit(Generic[S]):
     def run(self, store: S) -> str:
         """Execute the full lifecycle. Returns action label."""
         p = self.prep(store)
-        e = self.exec(p)
+        e = self._exec_with_retry(p)
         return self.post(store, e)
+
+    def _exec_with_retry(self, prep_result: Any) -> Any:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self.exec(prep_result)
+            except Exception as exc:
+                last_error = exc
+                if attempt == self.max_retries:
+                    return self.exec_fallback(prep_result, exc)
+        raise last_error  # unreachable but satisfies type checker
+
+
+class AsyncUnit(Generic[S]):
+    """
+    Async variant of Unit. prep/post stay sync, only exec is async.
+
+    For LLM network I/O where async is essential for concurrency.
+    """
+
+    max_retries: int = 0
+
+    def prep(self, store: S) -> Any:
+        return None
+
+    async def exec(self, prep_result: Any) -> Any:
+        return prep_result
+
+    async def exec_fallback(self, prep_result: Any, error: Exception) -> Any:
+        raise error
+
+    def post(self, store: S, exec_result: Any) -> str:
+        return "default"
+
+    async def arun(self, store: S) -> str:
+        p = self.prep(store)
+        e = await self._exec_with_retry(p)
+        return self.post(store, e)
+
+    async def _exec_with_retry(self, prep_result: Any) -> Any:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await self.exec(prep_result)
+            except Exception as exc:
+                last_error = exc
+                if attempt == self.max_retries:
+                    return await self.exec_fallback(prep_result, exc)
+        raise last_error  # unreachable
 
 
 class FunctionUnit(Unit[S]):
@@ -300,6 +376,54 @@ class Wire:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FLOW — Directed graph of Units + Wires
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _merge_fanout_results(
+    store: StoreBase,
+    results: list[dict],
+    original_values: dict,
+    registry: ReducerRegistry,
+) -> None:
+    """Merge parallel fan-out results back into the original store using reducers."""
+    # Skip internal fields
+    skip_fields = {"_checkpoints", "_history", "_created_at"}
+
+    # Collect all fields that changed in any result
+    all_fields = set()
+    for r in results:
+        all_fields.update(r.keys())
+    all_fields -= skip_fields
+
+    for field_name in all_fields:
+        orig_val = original_values.get(field_name)
+        merged = orig_val
+        for result_dict in results:
+            if field_name not in result_dict:
+                continue
+            new_val = result_dict[field_name]
+            if new_val != orig_val:
+                merged = registry.reduce(store, field_name, merged, new_val)
+        if merged != orig_val:
+            setattr(store, field_name, merged)
+
+
+class _CountingWrapper(Unit):
+    """Wraps a Unit to count executions for loop() termination."""
+
+    def __init__(self, inner: Unit, counter: list[int]):
+        self._inner = inner
+        self._counter = counter
+        self.max_retries = getattr(inner, "max_retries", 0)
+
+    def prep(self, store):
+        return self._inner.prep(store)
+
+    def exec(self, prep_result):
+        return self._inner.exec(prep_result)
+
+    def post(self, store, exec_result):
+        self._counter[0] += 1
+        return self._inner.post(store, exec_result)
 
 
 class InterruptSignal(Exception):  # noqa: N818 — Signal, not Error
@@ -398,7 +522,7 @@ class Flow(Generic[S]):
                     "step": steps,
                     "unit": current,
                     "action": action,
-                    "state_snapshot": store.to_dict() if hasattr(store, "to_dict") else str(store),
+                    "state_snapshot": store.model_dump(),
                 }
             )
 
@@ -410,9 +534,146 @@ class Flow(Generic[S]):
 
     def resume(self, store: S, from_node: str, **kwargs) -> S:
         """Resume after an interrupt. Continues from the target of the interrupted wire."""
-        # Find the interrupted wire and continue to its target
         self._entry = from_node
         return self.run(store)
+
+    async def arun(
+        self,
+        store: S,
+        *,
+        max_steps: int = 100,
+        on_token: Callable | None = None,
+    ) -> S:
+        """
+        Async execution path. Auto-detects sync vs async units.
+
+        For async fan-out uses asyncio.gather() instead of threads.
+        Pass on_token callback for streaming support.
+        """
+        if not self._entry:
+            raise RuntimeError("No entry point set. Call flow.entry('name')")
+
+        self._trace = []
+        current = self._entry
+        steps = 0
+
+        while current and steps < max_steps:
+            steps += 1
+            unit = self._units.get(current)
+            if unit is None:
+                raise RuntimeError(f"Unknown unit '{current}'")
+
+            # Execute unit — async or sync
+            if isinstance(unit, AsyncUnit):
+                # Pass on_token for streaming support
+                if on_token:
+                    unit._on_token = on_token
+                action = await unit.arun(store)
+            else:
+                action = unit.run(store)
+
+            self._trace.append(
+                {
+                    "step": steps,
+                    "unit": current,
+                    "action": action,
+                    "state_snapshot": store.model_dump(),
+                }
+            )
+
+            # Find next node — handle async fan-out
+            next_node = await self._aresolve_next(current, action, store, on_token)
+            current = next_node
+
+        return store
+
+    async def _aresolve_next(
+        self, current: str, action: str, store: S, on_token: Callable | None = None
+    ) -> str | None:
+        """Async version of _resolve_next with asyncio.gather for fan-out."""
+        wires = self._wires.get(current, [])
+
+        for w in wires:
+            if w.on != action and w.on != "*":
+                continue
+            if w.when is not None and not w.when(store):
+                continue
+            if w.interrupt:
+                raise InterruptSignal(w, store, current)
+            if isinstance(w.target, list):
+                await self._arun_fanout(w.target, store, on_token)
+                return None
+            return w.target
+
+        return None
+
+    def _build_fanout_registry(self, store: S) -> ReducerRegistry:
+        """Build a merged reducer registry from store class + flow-level reducers."""
+        store_registry = ReducerRegistry.from_store_class(store.__class__)
+        return store_registry.merge(self._reducers)
+
+    async def _arun_fanout(
+        self, targets: list[str], store: S, on_token: Callable | None = None
+    ) -> None:
+        """Async fan-out using asyncio.gather with reducer-based merge."""
+        units = [(t, self._units[t]) for t in targets if t in self._units]
+        if not units:
+            return
+
+        registry = self._build_fanout_registry(store)
+        original_values = store.model_dump()
+
+        async def _run_one(unit, store_copy):
+            if isinstance(unit, AsyncUnit):
+                if on_token:
+                    unit._on_token = on_token
+                await unit.arun(store_copy)
+            else:
+                unit.run(store_copy)
+            return store_copy.model_dump()
+
+        copies = [(u, store.model_copy(deep=True)) for _name, u in units]
+        results = await asyncio.gather(*[_run_one(u, c) for u, c in copies])
+
+        _merge_fanout_results(store, results, original_values, registry)
+
+    def loop(
+        self,
+        generator: str,
+        evaluator: str,
+        *,
+        until: Callable[[S], bool],
+        max_rounds: int = 5,
+    ) -> Flow[S]:
+        """
+        Sugar for evaluator-optimizer loop pattern.
+
+        Wires: generator -> evaluator (always),
+               evaluator -> generator (when not until),
+               evaluator -> end (when until or max_rounds).
+
+        Tracks rounds via a `_loop_rounds` counter on the store.
+        """
+        round_counter = [0]
+
+        def _check_continue(store: S) -> bool:
+            return not until(store) and round_counter[0] < max_rounds
+
+        def _check_done(store: S) -> bool:
+            return until(store) or round_counter[0] >= max_rounds
+
+        original_unit = self._units.get(evaluator)
+        if original_unit is None:
+            raise ValueError(f"Unknown unit '{evaluator}'")
+        self._units[evaluator] = _CountingWrapper(original_unit, round_counter)
+
+        self.wire(generator, evaluator)
+        self.wire(evaluator, generator, on="default", when=_check_continue)
+        # Terminal wire — a no-op FunctionUnit as the end sentinel
+        end_name = f"_loop_end_{generator}_{evaluator}"
+        self.add(end_name, FunctionUnit(lambda s: "default"))
+        self.wire(evaluator, end_name, on="default", when=_check_done)
+        return self
 
     def _resolve_next(self, current: str, action: str, store: S) -> str | None:
         """Resolve the next node based on wires, action label, and conditions."""
@@ -428,15 +689,34 @@ class Flow(Generic[S]):
             # Interrupt check
             if w.interrupt:
                 raise InterruptSignal(w, store, current)
-            # Fan-out (parallel) — run all targets sequentially for now
+            # Fan-out (parallel) — real concurrent execution
             if isinstance(w.target, list):
-                for t in w.target:
-                    if t in self._units:
-                        self._units[t].run(store)
+                self._run_fanout(w.target, store)
                 return None  # fan-out terminates this branch
             return w.target
 
         return None  # no matching wire = end of flow
+
+    def _run_fanout(self, targets: list[str], store: S) -> None:
+        """Run fan-out targets concurrently using ThreadPoolExecutor with reducer-based merge."""
+        units = [(t, self._units[t]) for t in targets if t in self._units]
+        if not units:
+            return
+
+        registry = self._build_fanout_registry(store)
+        original_values = store.model_dump()
+
+        def _run_on_copy(unit: Unit, store_copy: StoreBase) -> dict:
+            unit.run(store_copy)
+            return store_copy.model_dump()
+
+        copies = [(u, store.model_copy(deep=True)) for _name, u in units]
+
+        with ThreadPoolExecutor(max_workers=len(copies)) as pool:
+            futures = [pool.submit(_run_on_copy, u, c) for u, c in copies]
+            results = [f.result() for f in futures]
+
+        _merge_fanout_results(store, results, original_values, registry)
 
     # ── Introspection ──
 
@@ -459,6 +739,18 @@ class Flow(Generic[S]):
                 for t in targets:
                     result.append((src, t, w.on))
         return result
+
+    def to_mermaid(self) -> str:
+        """Export flow as a Mermaid graph definition."""
+        lines = ["graph TD"]
+        if self._entry:
+            lines.append(f"    style {self._entry} fill:#4CAF50,color:#fff")
+        for src, tgt, label in self.edges:
+            if label == "default":
+                lines.append(f"    {src} --> {tgt}")
+            else:
+                lines.append(f"    {src} -->|{label}| {tgt}")
+        return "\n".join(lines)
 
     def describe(self) -> str:
         """Human-readable graph description."""

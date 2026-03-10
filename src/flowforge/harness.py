@@ -13,10 +13,10 @@ and encodes best-practice patterns.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, ClassVar
 
-from .core import FlexStore, Flow, FunctionUnit, ReducerRegistry, StoreBase, Unit
+from .core import AsyncUnit, FlexStore, Flow, FunctionUnit, ReducerRegistry, StoreBase, Unit
 from .identity import Persona, Task
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -26,6 +26,30 @@ from .identity import Persona, Task
 # Type for LLM calling functions
 # Signature: (system: str, user: str, tools: list) -> str
 LLMFunction = Callable[..., str]
+
+# Type for async LLM calling functions
+AsyncLLMFunction = Callable[..., Awaitable[str]]
+
+
+def _llm_prep(unit, store: StoreBase) -> dict:
+    """Shared prep logic for LLMUnit and AsyncLLMUnit."""
+    context = {}
+    for field_name in unit.task.context_from:
+        if hasattr(store, field_name):
+            context[field_name] = getattr(store, field_name)
+    return {
+        "system": unit.persona.to_prompt(),
+        "user": unit.task.to_prompt(context),
+        "tools": unit.tools,
+    }
+
+
+def _llm_post(unit, store: StoreBase, exec_result: dict) -> str:
+    """Shared post logic for LLMUnit and AsyncLLMUnit."""
+    output = exec_result["output"]
+    if hasattr(store, unit.output_field) or isinstance(store, FlexStore):
+        setattr(store, unit.output_field, output)
+    return "default"
 
 
 class LLMUnit(Unit):
@@ -55,17 +79,7 @@ class LLMUnit(Unit):
 
     def prep(self, store: StoreBase) -> dict:
         """Extract context from store and compile prompts."""
-        # Build context dict from store fields
-        context = {}
-        for field_name in self.task.context_from:
-            if hasattr(store, field_name):
-                context[field_name] = getattr(store, field_name)
-
-        return {
-            "system": self.persona.to_prompt(),
-            "user": self.task.to_prompt(context),
-            "tools": self.tools,
-        }
+        return _llm_prep(self, store)
 
     def exec(self, prep_result: dict) -> str:
         """Call the LLM. Pure computation — no store access."""
@@ -80,13 +94,47 @@ class LLMUnit(Unit):
 
     def post(self, store: StoreBase, exec_result: dict) -> str:
         """Write result to store. Return action for routing."""
-        output = exec_result["output"]
+        return _llm_post(self, store, exec_result)
 
-        # Write to the designated output field
-        if hasattr(store, self.output_field) or isinstance(store, FlexStore):
-            setattr(store, self.output_field, output)
 
-        return "default"
+class AsyncLLMUnit(AsyncUnit):
+    """
+    Async variant of LLMUnit. Same prep/post (sync), async exec.
+
+    Supports optional streaming via on_token callback.
+    """
+
+    def __init__(
+        self,
+        persona: Persona,
+        task: Task,
+        llm_fn: AsyncLLMFunction,
+        tools: list = None,
+        output_field: str = None,
+    ):
+        self.persona = persona
+        self.task = task
+        self.llm_fn = llm_fn
+        self.tools = tools or []
+        self.output_field = output_field or task.output_field or task.description
+        self._on_token: Callable | None = None
+
+    def prep(self, store: StoreBase) -> dict:
+        return _llm_prep(self, store)
+
+    async def exec(self, prep_result: dict) -> dict:
+        start = time.monotonic()
+        result = await self.llm_fn(
+            system=prep_result["system"],
+            user=prep_result["user"],
+            tools=prep_result.get("tools", []),
+            on_token=self._on_token,
+        )
+        elapsed = (time.monotonic() - start) * 1000
+        return {"output": result, "latency_ms": elapsed}
+
+    def post(self, store: StoreBase, exec_result: dict) -> str:
+        return _llm_post(self, store, exec_result)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -202,29 +250,21 @@ class Team:
     """
     Multi-agent harness. Compiles Agents into a Flow graph.
 
-    Strategies:
+    Built-in strategies:
         "sequential"    — agents run one after another (pipeline)
         "parallel"      — all agents run, results merge via reducers
         "hierarchical"  — manager decomposes and delegates to workers
         "consensus"     — all agents run, then a vote/merge step
 
-    Usage:
-        team = Team(
-            [researcher, coder, reviewer],
-            strategy="sequential",
-        )
-        result = team.run("Build a CLI tool")
+    Custom strategies via Team.register_strategy():
+        Team.register_strategy("my_strategy", my_builder_fn)
+        # builder_fn signature: (team: Team, task_desc: str) -> Flow
 
     Escape hatch: team.graph gives you the compiled Flow
     for manual Wire additions.
-
-        g = team.graph
-        g.wire("reviewer", "coder",
-               on="needs_fix",
-               when=lambda s: s.confidence < 0.8)
     """
 
-    STRATEGIES = ["sequential", "parallel", "hierarchical", "consensus"]
+    _strategy_registry: ClassVar[dict[str, Callable]] = {}
 
     def __init__(
         self,
@@ -235,8 +275,14 @@ class Team:
         store_class: type[StoreBase] = None,
         reducers: dict[str, str] = None,
     ):
-        if strategy not in self.STRATEGIES:
-            raise ValueError(f"Unknown strategy '{strategy}'. Options: {self.STRATEGIES}")
+        all_strategies = list(self._strategy_registry.keys()) + [
+            "sequential",
+            "parallel",
+            "hierarchical",
+            "consensus",
+        ]
+        if strategy not in all_strategies:
+            raise ValueError(f"Unknown strategy '{strategy}'. Options: {all_strategies}")
         self.agents = agents
         self.strategy = strategy
         self.manager = manager
@@ -244,12 +290,21 @@ class Team:
         self._reducers = ReducerRegistry(reducers) if reducers else ReducerRegistry()
         self._flow: Flow | None = None
 
+    @classmethod
+    def register_strategy(cls, name: str, builder_fn: Callable) -> None:
+        """Register a custom strategy. builder_fn(team, task_desc) -> Flow"""
+        cls._strategy_registry[name] = builder_fn
+
     def compile(self, task_desc: str = "") -> Flow:
         """
         Compile agents + strategy into a Flow graph.
 
         Returns the Flow for inspection or modification before execution.
         """
+        # Check custom registry first
+        if self.strategy in self._strategy_registry:
+            self._flow = self._strategy_registry[self.strategy](self, task_desc)
+            return self._flow
         builder = getattr(self, f"_build_{self.strategy}")
         self._flow = builder(task_desc)
         return self._flow
@@ -309,7 +364,12 @@ class Team:
 
     def _build_parallel(self, task_desc: str = "") -> Flow:
         """Fan-out to all agents, fan-in at the end."""
-        flow = Flow(reducers=self._reducers)
+        # Build reducer registry: store class __reducers__ + explicit reducers
+        if self.store_class:
+            store_reg = ReducerRegistry.from_store_class(self.store_class)
+            flow = Flow(reducers=store_reg.merge(self._reducers))
+        else:
+            flow = Flow(reducers=self._reducers)
 
         # Dispatcher node
         flow.add("dispatch", FunctionUnit(lambda s: "default"))
@@ -403,10 +463,29 @@ class Team:
 
 def _make_default_llm(model: str = None) -> LLMFunction:
     """
-    Create a default LLM function.
+    Create a default LLM function using LiteLLM.
 
-    In production, this would call LiteLLM, OpenAI, Anthropic, etc.
-    Override with your own llm_fn for full control.
+    Bring-your-own llm_fn for full control:
+
+        # OpenAI direct:
+        from openai import OpenAI
+        client = OpenAI()
+        def my_llm(system, user, tools=None, **kw):
+            r = client.chat.completions.create(
+                model="gpt-4o", messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ])
+            return r.choices[0].message.content
+
+        # Anthropic direct:
+        from anthropic import Anthropic
+        client = Anthropic()
+        def my_llm(system, user, tools=None, **kw):
+            r = client.messages.create(
+                model="claude-sonnet-4-20250514", max_tokens=4096,
+                system=system, messages=[{"role": "user", "content": user}])
+            return r.content[0].text
     """
     _model = model or "gpt-4o-mini"
 
@@ -423,8 +502,61 @@ def _make_default_llm(model: str = None) -> LLMFunction:
             )
             return response.choices[0].message.content
         except ImportError:
-            # Fallback: return a placeholder for testing
             return f"[{_model}] Would respond to: {user[:100]}..."
+        except Exception as exc:
+            return f"[{_model}] LLM error: {exc}"
+
+    return _call
+
+
+def _make_default_async_llm(model: str = None) -> AsyncLLMFunction:
+    """
+    Create a default async LLM function using LiteLLM acompletion.
+
+    Supports streaming via on_token callback.
+    """
+    _model = model or "gpt-4o-mini"
+
+    async def _call(
+        system: str,
+        user: str,
+        tools: list = None,
+        on_token: Callable | None = None,
+        **kwargs,
+    ) -> str:
+        try:
+            import litellm
+
+            if on_token:
+                # Streaming mode
+                response = await litellm.acompletion(
+                    model=_model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    stream=True,
+                )
+                chunks = []
+                async for chunk in response:
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        chunks.append(delta)
+                        on_token(delta)
+                return "".join(chunks)
+            else:
+                response = await litellm.acompletion(
+                    model=_model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+                return response.choices[0].message.content
+        except ImportError:
+            return f"[{_model}] Would respond to: {user[:100]}..."
+        except Exception as exc:
+            return f"[{_model}] LLM error: {exc}"
 
     return _call
 

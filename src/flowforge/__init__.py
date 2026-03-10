@@ -23,6 +23,7 @@ Quick start:
 """
 
 from flowforge.core import (
+    AsyncUnit,
     FlexStore,
     Flow,
     FunctionUnit,
@@ -34,6 +35,7 @@ from flowforge.core import (
 )
 from flowforge.harness import (
     Agent,
+    AsyncLLMUnit,
     LLMUnit,
     Team,
     agent,
@@ -51,6 +53,7 @@ __all__ = [
     "StoreBase",
     "FlexStore",
     "Unit",
+    "AsyncUnit",
     "FunctionUnit",
     "Wire",
     "Flow",
@@ -63,6 +66,7 @@ __all__ = [
     "Agent",
     "Team",
     "LLMUnit",
+    "AsyncLLMUnit",
     "agent",
     "team",
 ]
