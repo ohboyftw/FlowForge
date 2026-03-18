@@ -470,9 +470,8 @@ class Team:
 
         flow.add("consensus", FunctionUnit(consensus_fn))
 
-        # Wire all workers to consensus (override fan-out termination)
-        for agent in self.agents:
-            flow.wire(agent.name, "consensus")
+        # Continuation wire from dispatch → consensus (runs after fan-out completes)
+        flow.wire("dispatch", "consensus")
 
         return flow
 
