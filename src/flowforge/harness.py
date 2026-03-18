@@ -335,6 +335,25 @@ class Team:
 
         return flow.run(store)
 
+    async def arun(
+        self,
+        task_desc: str,
+        *,
+        store: StoreBase = None,
+        max_steps: int = 100,
+        raise_on_exhaust: bool = False,
+    ) -> StoreBase:
+        """Async execution. Mirrors run() but uses flow.arun()."""
+        flow = self.compile(task_desc)
+        if store is None:
+            if self.store_class:
+                store = self.store_class(task=task_desc)
+            else:
+                store = FlexStore(task=task_desc)
+        return await flow.arun(
+            store, max_steps=max_steps, raise_on_exhaust=raise_on_exhaust
+        )
+
     def describe(self) -> str:
         """Human-readable description of the compiled flow."""
         if not self._flow:
