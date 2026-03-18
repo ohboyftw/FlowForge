@@ -93,6 +93,34 @@ def test_hierarchical_team_smoke():
     assert "dev2" in flow.nodes
 
 
+def test_hierarchical_parallel_workers():
+    """Hierarchical team wires workers as fan-out, not sequential."""
+    mgr = Agent("Manager", "Manage", llm_fn=_mock_llm)
+    w1 = Agent("Dev1", "Code", llm_fn=_mock_llm)
+    w2 = Agent("Dev2", "Test", llm_fn=_mock_llm)
+    t = Team([w1, w2], strategy="hierarchical", manager=mgr)
+
+    flow = t.compile("build")
+
+    # Workers should appear in a fan-out from decompose
+    decompose_edges = [(s, tgt, lbl) for s, tgt, lbl in flow.edges if s == "decompose"]
+    targets = [tgt for _, tgt, _ in decompose_edges]
+
+    # Both workers and synthesize should be targets of decompose
+    assert "dev1" in targets
+    assert "dev2" in targets
+    assert "synthesize" in targets
+
+    # No direct worker → synthesize edges (continuation handles it)
+    worker_synth = [(s, t) for s, t, _ in flow.edges if s in ("dev1", "dev2") and t == "synthesize"]
+    assert worker_synth == []
+
+    # End-to-end: should run to completion
+    store = FlexStore(task="hierarchical test")
+    result = t.run("build something", store=store)
+    assert hasattr(result, "final_result")
+
+
 # ── Consensus team ──
 
 
@@ -106,6 +134,25 @@ def test_consensus_team_smoke():
 
     assert "consensus" in flow.nodes
     assert "dispatch" in flow.nodes
+
+
+def test_consensus_reaches_consensus_node():
+    """Consensus strategy reaches the consensus node with new fan-out semantics."""
+    agents = [
+        Agent("ReviewerA", "Review A", llm_fn=_mock_llm),
+        Agent("ReviewerB", "Review B", llm_fn=_mock_llm),
+    ]
+    team = Team(agents, strategy="consensus")
+
+    store = FlexStore(task="consensus test")
+    result = team.run("review code", store=store)
+
+    # The flow should complete — consensus node ran
+    assert result is not None
+    # Verify consensus node actually executed by checking the trace
+    flow = team.graph
+    node_names = [entry["unit"] for entry in flow.trace]
+    assert "consensus" in node_names, f"consensus node not in trace: {node_names}"
 
 
 # ── Flow compilation escape hatch ──

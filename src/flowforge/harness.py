@@ -409,13 +409,13 @@ class Team:
         return flow
 
     def _build_hierarchical(self, task_desc: str = "") -> Flow:
-        """Manager decomposes, workers execute, manager synthesizes."""
+        """Manager decomposes, workers execute in parallel, manager synthesizes."""
         flow = Flow(reducers=self._reducers)
 
         mgr = self.manager or Agent(
             "Manager",
             "Decompose and delegate tasks",
-            llm_fn=self.agents[0].llm_fn,  # inherit LLM from first agent
+            llm_fn=self.agents[0].llm_fn,
         )
 
         # Manager decomposition
@@ -427,6 +427,7 @@ class Team:
         flow.add("decompose", mgr.as_unit(decompose_task))
 
         # Worker nodes
+        worker_names = []
         for agent in self.agents:
             task = Task(
                 description=task_desc,
@@ -434,18 +435,19 @@ class Team:
                 output_field=agent.name,
             )
             flow.add(agent.name, agent.as_unit(task))
-            flow.wire("decompose", agent.name)
+            worker_names.append(agent.name)
 
-        # Manager synthesis
+        # Fan-out: decompose → all workers in parallel
+        flow.wire("decompose", worker_names)
+
+        # Continuation: after fan-out merges → synthesize
         synthesize_task = Task(
             description="Synthesize team outputs into final result",
             context_from=[a.name for a in self.agents],
             output_field="final_result",
         )
         flow.add("synthesize", mgr.as_unit(synthesize_task))
-
-        for agent in self.agents:
-            flow.wire(agent.name, "synthesize")
+        flow.wire("decompose", "synthesize")
 
         flow.entry("decompose")
         return flow
