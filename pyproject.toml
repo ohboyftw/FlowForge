@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "flowforge"
 version = "0.1.0"
-description = "Unified agent orchestration — PocketFlow + LangGraph + CrewAI + Agno in ~250 lines"
+description = "Unified agent orchestration — PocketFlow + LangGraph + CrewAI + Agno in ~1600 lines"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

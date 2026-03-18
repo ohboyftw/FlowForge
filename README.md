@@ -7,7 +7,7 @@
                                          |___/
 ```
 
-**Unified agent orchestration in ~800 lines of Python.**
+**Unified agent orchestration in ~1600 lines of Python.**
 
 PocketFlow's graph primitives + LangGraph's state machines + CrewAI's roles + Agno's ergonomics — one framework, progressive disclosure.
 
@@ -183,17 +183,7 @@ class FetchUnit(AsyncUnit):
         async with aiohttp.ClientSession() as s:
             return await (await s.get(url)).text()
 
-await flow.run_async(state)
-```
-
-## 5 Primitives, Zero More
-
-```
-  Unit ─────── Atomic computation: prep() → exec() → post()
-  Wire ─────── Typed edge with conditions, interrupts, fan-out
-  Persona ──── Role / goal / backstory → compiles to system prompt
-  StoreBase ── Pydantic-typed shared state with checkpoints
-  Harness ──── Agent() / Team() — ergonomic entry points
+await flow.arun(state)
 ```
 
 ## Examples
@@ -222,8 +212,8 @@ python examples/01_research_report.py
 FlowForge is model-agnostic. Pass any `(system, user, tools?) -> str` callable:
 
 ```python
-# LiteLLM — any provider
-import litellm
+import litellm  # or anthropic, openai — any provider works
+
 def my_llm(system, user, tools=None):
     resp = litellm.completion(
         model="claude-sonnet-4-20250514",
@@ -235,31 +225,7 @@ def my_llm(system, user, tools=None):
 agent = Agent("Researcher", "Find data", llm_fn=my_llm)
 ```
 
-```python
-# Anthropic direct
-import anthropic
-client = anthropic.Anthropic()
-def claude_llm(system, user, tools=None):
-    resp = client.messages.create(
-        model="claude-sonnet-4-20250514", max_tokens=4096,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return resp.content[0].text
-```
-
-```python
-# OpenAI direct
-from openai import OpenAI
-client = OpenAI()
-def openai_llm(system, user, tools=None):
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-    )
-    return resp.choices[0].message.content
-```
+The pattern is the same for any provider — wrap the client call in a `(system, user, tools?) -> str` function. See the [examples](examples/) for Anthropic and OpenAI variants.
 
 ## Escape Hatches
 

@@ -2,7 +2,7 @@
 FlowForge — Unified Agent Orchestration Framework
 
 Combines the best of PocketFlow, LangGraph, CrewAI, and Agno
-into ~250 lines of core Python with Pydantic-typed state.
+into ~1600 lines of core Python with Pydantic-typed state.
 
 Quick start:
     from flowforge import Agent, Team, StoreBase
