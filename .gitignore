@@ -31,3 +31,9 @@ htmlcov/
 
 # Ruff
 .ruff_cache/
+
+# Claude Code
+.claude/settings.local.json
+
+# Code graph
+.codegraph/
