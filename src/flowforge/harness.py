@@ -350,9 +350,7 @@ class Team:
                 store = self.store_class(task=task_desc)
             else:
                 store = FlexStore(task=task_desc)
-        return await flow.arun(
-            store, max_steps=max_steps, raise_on_exhaust=raise_on_exhaust
-        )
+        return await flow.arun(store, max_steps=max_steps, raise_on_exhaust=raise_on_exhaust)
 
     def describe(self) -> str:
         """Human-readable description of the compiled flow."""

@@ -4,6 +4,8 @@ FlowForge Test Suite
 """
 
 import json
+import logging
+import time as time_mod
 
 from pydantic import Field, ValidationError
 
@@ -11,6 +13,7 @@ from flowforge import (
     Agent,
     FlexStore,
     Flow,
+    FlowExhaustedError,
     FunctionUnit,
     InterruptSignal,
     LLMUnit,
@@ -350,3 +353,292 @@ class TestHarness:
         g.wire("beta", "alpha", on="retry", when=lambda s: True)
         edges = g.edges
         assert any(e[0] == "beta" and e[1] == "alpha" for e in edges)
+
+
+# ═══════════════════════════════════════════════════════════
+# Wire validation tests
+# ═══════════════════════════════════════════════════════════
+
+
+class TestWireValidation:
+    def test_wire_validation_catches_typo(self):
+        """Wire to nonexistent node raises ValueError at run time."""
+        flow = Flow()
+        flow.add("a", FunctionUnit(lambda s: "default"))
+        flow.wire("a", "nonexistent")
+        flow.entry("a")
+
+        import pytest
+
+        with pytest.raises(ValueError, match="nonexistent"):
+            flow.run(CounterState())
+
+    def test_wire_validation_allows_late_add(self):
+        """Wiring before adding nodes is OK — validated at run time."""
+        flow = Flow()
+        flow.wire("a", "b")  # wire before add
+        flow.add("a", IncrementUnit("a", 1))
+        flow.add("b", IncrementUnit("b", 10))
+        flow.entry("a")
+
+        result = flow.run(CounterState())
+        assert result.count == 11
+
+    def test_wire_validation_bad_source(self):
+        """Wire from nonexistent source raises ValueError."""
+        flow = Flow()
+        flow.add("b", FunctionUnit(lambda s: "default"))
+        flow.wire("ghost", "b")
+        flow.entry("b")
+
+        import pytest
+
+        with pytest.raises(ValueError, match="ghost"):
+            flow.run(CounterState())
+
+    def test_entry_allows_lazy_set(self):
+        """entry() no longer validates eagerly — accepts unknown names."""
+        flow = Flow()
+        flow.entry("future_node")  # should NOT raise
+        flow.add("future_node", FunctionUnit(lambda s: "default"))
+        flow.run(CounterState())  # validates at run time — should pass
+
+
+# ═══════════════════════════════════════════════════════════
+# Max steps tests
+# ═══════════════════════════════════════════════════════════
+
+
+class TestMaxSteps:
+    def test_max_steps_warning(self, caplog):
+        """Flow logs warning when max_steps is hit."""
+        flow = Flow()
+        flow.add("loop", FunctionUnit(lambda s: "default"))
+        flow.wire("loop", "loop")
+        flow.entry("loop")
+
+        with caplog.at_level(logging.WARNING, logger="flowforge.core"):
+            flow.run(CounterState(), max_steps=5)
+
+        assert "max_steps=5" in caplog.text
+
+    def test_max_steps_raises_when_opted_in(self):
+        """FlowExhaustedError raised when raise_on_exhaust=True."""
+        flow = Flow()
+        flow.add("loop", FunctionUnit(lambda s: "default"))
+        flow.wire("loop", "loop")
+        flow.entry("loop")
+
+        import pytest
+
+        with pytest.raises(FlowExhaustedError) as exc_info:
+            flow.run(CounterState(), max_steps=3, raise_on_exhaust=True)
+        assert exc_info.value.steps == 3
+
+    def test_max_steps_no_warning_when_not_exhausted(self, caplog):
+        """No warning when flow completes before max_steps."""
+        flow = Flow()
+        flow.add("a", IncrementUnit("a", 1))
+        flow.entry("a")
+
+        with caplog.at_level(logging.WARNING, logger="flowforge.core"):
+            flow.run(CounterState())
+
+        assert "max_steps" not in caplog.text
+
+
+# ═══════════════════════════════════════════════════════════
+# Trace timing tests
+# ═══════════════════════════════════════════════════════════
+
+
+class TestTraceTiming:
+    def test_trace_has_duration(self):
+        """Each trace entry includes duration_ms."""
+        flow = Flow()
+        flow.add("a", IncrementUnit("a", 1))
+        flow.add("b", IncrementUnit("b", 10))
+        flow.wire("a", "b")
+        flow.entry("a")
+
+        flow.run(CounterState())
+
+        for entry in flow.trace:
+            assert "duration_ms" in entry
+            assert isinstance(entry["duration_ms"], float)
+            assert entry["duration_ms"] >= 0
+
+
+# ═══════════════════════════════════════════════════════════
+# Fan-out continuation tests (DESIGN-006)
+# ═══════════════════════════════════════════════════════════
+
+
+class TestFanoutContinuation:
+    def test_fanout_then_continue(self):
+        """After fan-out completes, next wire from same source runs."""
+        flow = Flow()
+        flow.add("dispatch", FunctionUnit(lambda s: "default"))
+        flow.add("w1", IncrementUnit("w1", 1))
+        flow.add("w2", IncrementUnit("w2", 10))
+        flow.add("aggregate", IncrementUnit("aggregate", 100))
+
+        flow.wire("dispatch", ["w1", "w2"])  # fan-out
+        flow.wire("dispatch", "aggregate")  # continuation
+        flow.entry("dispatch")
+
+        result = flow.run(CounterState())
+        # w1=1, w2=10 merged, then aggregate=+100
+        assert result.count >= 100  # aggregate ran
+
+    def test_multiple_fanouts_sequential_barrier(self):
+        """Multiple fan-out wires on same node run sequentially."""
+        flow = Flow()
+        flow.add("dispatch", FunctionUnit(lambda s: "default"))
+        flow.add("a", IncrementUnit("a", 1))
+        flow.add("b", IncrementUnit("b", 10))
+        flow.add("final", IncrementUnit("final", 100))
+
+        flow.wire("dispatch", ["a"])  # first fan-out
+        flow.wire("dispatch", ["b"])  # second fan-out
+        flow.wire("dispatch", "final")  # continuation
+        flow.entry("dispatch")
+
+        result = flow.run(CounterState())
+        assert result.count >= 100  # final ran after both fan-outs
+
+
+# ═══════════════════════════════════════════════════════════
+# Error routing tests (FEAT-010)
+# ═══════════════════════════════════════════════════════════
+
+
+class FailingExecUnit(Unit):
+    def exec(self, _):
+        raise ValueError("boom")
+
+
+class ErrorCatcherUnit(Unit):
+    def post(self, store, _):
+        err = getattr(store, "_last_error", None)
+        store.log = store.log + [f"caught:{err}"]
+        return "default"
+
+
+class TestErrorRouting:
+    def test_wire_level_error_route(self):
+        """on='error' wire catches unit exception."""
+        flow = Flow()
+        flow.add("fail", FailingExecUnit())
+        flow.add("handler", ErrorCatcherUnit())
+        flow.wire("fail", "handler", on="error")
+        flow.entry("fail")
+
+        state = CounterState()
+        flow.run(state)
+        assert any("caught:" in entry for entry in state.log)
+
+    def test_flow_level_error_fallback(self):
+        """Flow-level on_error catches when no wire-level route."""
+        flow = Flow(on_error="handler")
+        flow.add("fail", FailingExecUnit())
+        flow.add("handler", ErrorCatcherUnit())
+        flow.entry("fail")
+
+        state = CounterState()
+        flow.run(state)
+        assert any("caught:" in entry for entry in state.log)
+
+    def test_no_route_reraises(self):
+        """Without error routing, exception propagates."""
+        flow = Flow()
+        flow.add("fail", FailingExecUnit())
+        flow.entry("fail")
+
+        import pytest
+
+        with pytest.raises(ValueError, match="boom"):
+            flow.run(CounterState())
+
+    def test_interrupt_not_caught_by_error_routing(self):
+        """InterruptSignal bypasses error routing."""
+        flow = Flow(on_error="handler")
+        flow.add("a", FunctionUnit(lambda s: "default"))
+        flow.add("b", FunctionUnit(lambda s: "default"))
+        flow.add("handler", ErrorCatcherUnit())
+        flow.wire("a", "b", interrupt=True)
+        flow.entry("a")
+
+        import pytest
+
+        with pytest.raises(InterruptSignal):
+            flow.run(CounterState())
+
+    def test_error_trace_entry(self):
+        """Error produces a trace entry with error info."""
+        flow = Flow()
+        flow.add("fail", FailingExecUnit())
+        flow.add("handler", ErrorCatcherUnit())
+        flow.wire("fail", "handler", on="error")
+        flow.entry("fail")
+
+        flow.run(CounterState())
+        error_entries = [e for e in flow.trace if e.get("action") == "error"]
+        assert len(error_entries) == 1
+        assert "boom" in error_entries[0]["error"]
+
+
+# ═══════════════════════════════════════════════════════════
+# Timeout tests (FEAT-005)
+# ═══════════════════════════════════════════════════════════
+
+
+class SlowExecUnit(Unit):
+    timeout = None  # will be set per instance
+
+    def __init__(self, duration: float, timeout: float = None):
+        self._duration = duration
+        self.timeout = timeout
+
+    def exec(self, _):
+        time_mod.sleep(self._duration)
+        return "done"
+
+    def post(self, store, result):
+        store.log = store.log + ["completed"]
+        return "default"
+
+
+class TestTimeout:
+    def test_unit_timeout_raises(self):
+        """Unit with timeout raises TimeoutError when exceeded."""
+        flow = Flow()
+        flow.add("slow", SlowExecUnit(duration=2.0, timeout=0.1))
+        flow.add("handler", ErrorCatcherUnit())
+        flow.wire("slow", "handler", on="error")
+        flow.entry("slow")
+
+        state = CounterState()
+        flow.run(state)
+        assert any("caught:" in entry for entry in state.log)
+
+    def test_default_timeout_applies(self):
+        """Flow-level default_timeout applies to units without explicit timeout."""
+        flow = Flow()
+        flow.add("slow", SlowExecUnit(duration=2.0))  # no unit timeout
+        flow.add("handler", ErrorCatcherUnit())
+        flow.wire("slow", "handler", on="error")
+        flow.entry("slow")
+
+        state = CounterState()
+        flow.run(state, default_timeout=0.1)
+        assert any("caught:" in entry for entry in state.log)
+
+    def test_no_timeout_no_overhead(self):
+        """Units without timeout run normally."""
+        flow = Flow()
+        flow.add("fast", IncrementUnit("fast", 1))
+        flow.entry("fast")
+
+        result = flow.run(CounterState())
+        assert result.count == 1

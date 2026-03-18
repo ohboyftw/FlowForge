@@ -273,6 +273,7 @@ class Unit(Generic[S]):
     """
 
     max_retries: int = 0
+    timeout: float | None = None
 
     def prep(self, store: S) -> Any:
         """Extract what you need from state. Return prep context."""
@@ -297,12 +298,10 @@ class Unit(Generic[S]):
         return self.post(store, e)
 
     def _exec_with_retry(self, prep_result: Any) -> Any:
-        last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
                 return self.exec(prep_result)
             except Exception as exc:
-                last_error = exc
                 if attempt == self.max_retries:
                     return self.exec_fallback(prep_result, exc)
 
@@ -315,6 +314,7 @@ class AsyncUnit(Generic[S]):
     """
 
     max_retries: int = 0
+    timeout: float | None = None
 
     def prep(self, store: S) -> Any:
         return None
@@ -334,12 +334,10 @@ class AsyncUnit(Generic[S]):
         return self.post(store, e)
 
     async def _exec_with_retry(self, prep_result: Any) -> Any:
-        last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
                 return await self.exec(prep_result)
             except Exception as exc:
-                last_error = exc
                 if attempt == self.max_retries:
                     return await self.exec_fallback(prep_result, exc)
 
@@ -488,12 +486,13 @@ class Flow(Generic[S]):
         result = flow.run(state)
     """
 
-    def __init__(self, reducers: ReducerRegistry = None):
+    def __init__(self, reducers: ReducerRegistry = None, on_error: str | None = None):
         self._units: dict[str, Unit] = {}
         self._wires: dict[str, list[Wire]] = {}
         self._entry: str | None = None
         self._reducers = reducers or ReducerRegistry()
         self._trace: list[dict] = []
+        self._on_error = on_error
 
     # ── Graph construction (fluent API) ──
 
@@ -531,9 +530,7 @@ class Flow(Generic[S]):
                 targets = w.target if isinstance(w.target, list) else [w.target]
                 for t in targets:
                     if t not in self._units:
-                        errors.append(
-                            f"Wire target '{t}' (from '{src}') is not a registered unit"
-                        )
+                        errors.append(f"Wire target '{t}' (from '{src}') is not a registered unit")
         if not self._entry:
             errors.append("No entry point set")
         elif self._entry not in self._units:
@@ -543,13 +540,15 @@ class Flow(Generic[S]):
 
     # ── Execution ──
 
-    def run(self, store: S, *, max_steps: int = 100, raise_on_exhaust: bool = False) -> S:
-        """
-        Execute the flow. Returns the final store state.
-
-        Raises InterruptSignal if a human-in-the-loop wire is hit.
-        Caller can catch it, inspect store, and resume.
-        """
+    def run(
+        self,
+        store: S,
+        *,
+        max_steps: int = 100,
+        raise_on_exhaust: bool = False,
+        default_timeout: float | None = None,
+    ) -> S:
+        """Execute the flow. Returns the final store state."""
         self._validate_graph()
 
         self._trace = []
@@ -558,30 +557,63 @@ class Flow(Generic[S]):
 
         while current and steps < max_steps:
             steps += 1
-            unit = self._units[current]
+            unit = self._units.get(current)
+            if unit is None:
+                raise RuntimeError(f"Unknown unit '{current}'")
 
-            # Execute unit
             start = time.monotonic()
-            action = unit.run(store)
-            end = time.monotonic()
-            self._trace.append(
-                {
-                    "step": steps,
-                    "unit": current,
-                    "action": action,
-                    "duration_ms": round((end - start) * 1000, 2),
-                    "state_snapshot": store.model_dump(),
-                }
-            )
+            try:
+                effective_timeout = getattr(unit, "timeout", None) or default_timeout
+                if effective_timeout is not None:
+                    store_copy = store.model_copy(deep=True)
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(unit.run, store_copy)
+                        action = future.result(timeout=effective_timeout)
+                        for field_name in store.__class__.model_fields:
+                            setattr(store, field_name, getattr(store_copy, field_name))
+                else:
+                    action = unit.run(store)
+            except InterruptSignal:
+                raise
+            except Exception as exc:
+                end = time.monotonic()
+                object.__setattr__(store, "_last_error", exc)
+                self._trace.append(
+                    {
+                        "step": steps,
+                        "unit": current,
+                        "action": "error",
+                        "duration_ms": round((end - start) * 1000, 2),
+                        "error": str(exc),
+                        "state_snapshot": store.model_dump(),
+                    }
+                )
+                error_target = self._resolve_error_target(current)
+                if error_target:
+                    current = error_target
+                    continue
+                if self._on_error and self._on_error in self._units:
+                    current = self._on_error
+                    continue
+                raise
+            else:
+                end = time.monotonic()
+                object.__setattr__(store, "_last_error", None)
+                self._trace.append(
+                    {
+                        "step": steps,
+                        "unit": current,
+                        "action": action,
+                        "duration_ms": round((end - start) * 1000, 2),
+                        "state_snapshot": store.model_dump(),
+                    }
+                )
 
-            # Find next node
             next_node = self._resolve_next(current, action, store)
             current = next_node
 
         if steps >= max_steps:
-            logger.warning(
-                "Flow hit max_steps=%d at unit '%s'", max_steps, current
-            )
+            logger.warning("Flow hit max_steps=%d at unit '%s'", max_steps, current)
             if raise_on_exhaust:
                 raise FlowExhaustedError(steps, current)
 
@@ -599,13 +631,9 @@ class Flow(Generic[S]):
         max_steps: int = 100,
         raise_on_exhaust: bool = False,
         on_token: Callable | None = None,
+        default_timeout: float | None = None,
     ) -> S:
-        """
-        Async execution path. Auto-detects sync vs async units.
-
-        For async fan-out uses asyncio.gather() instead of threads.
-        Pass on_token callback for streaming support.
-        """
+        """Async execution path with error routing and timeout support."""
         self._validate_graph()
 
         self._trace = []
@@ -614,37 +642,75 @@ class Flow(Generic[S]):
 
         while current and steps < max_steps:
             steps += 1
-            unit = self._units[current]
+            unit = self._units.get(current)
+            if unit is None:
+                raise RuntimeError(f"Unknown unit '{current}'")
 
-            # Execute unit — async or sync
             start = time.monotonic()
-            if isinstance(unit, AsyncUnit):
-                # Pass on_token for streaming support
-                if on_token:
-                    unit._on_token = on_token
-                action = await unit.arun(store)
+            try:
+                effective_timeout = getattr(unit, "timeout", None) or default_timeout
+                if isinstance(unit, AsyncUnit):
+                    if on_token:
+                        unit._on_token = on_token
+                    if effective_timeout is not None:
+                        action = await asyncio.wait_for(unit.arun(store), timeout=effective_timeout)
+                    else:
+                        action = await unit.arun(store)
+                else:
+                    if effective_timeout is not None:
+                        store_copy = store.model_copy(deep=True)
+                        with ThreadPoolExecutor(max_workers=1) as pool:
+                            future = pool.submit(unit.run, store_copy)
+                            action = future.result(timeout=effective_timeout)
+                            for field_name in store.__class__.model_fields:
+                                setattr(
+                                    store,
+                                    field_name,
+                                    getattr(store_copy, field_name),
+                                )
+                    else:
+                        action = unit.run(store)
+            except InterruptSignal:
+                raise
+            except Exception as exc:
+                end = time.monotonic()
+                object.__setattr__(store, "_last_error", exc)
+                self._trace.append(
+                    {
+                        "step": steps,
+                        "unit": current,
+                        "action": "error",
+                        "duration_ms": round((end - start) * 1000, 2),
+                        "error": str(exc),
+                        "state_snapshot": store.model_dump(),
+                    }
+                )
+                error_target = self._resolve_error_target(current)
+                if error_target:
+                    current = error_target
+                    continue
+                if self._on_error and self._on_error in self._units:
+                    current = self._on_error
+                    continue
+                raise
             else:
-                action = unit.run(store)
-            end = time.monotonic()
+                end = time.monotonic()
+                object.__setattr__(store, "_last_error", None)
+                self._trace.append(
+                    {
+                        "step": steps,
+                        "unit": current,
+                        "action": action,
+                        "duration_ms": round((end - start) * 1000, 2),
+                        "state_snapshot": store.model_dump(),
+                    }
+                )
 
-            self._trace.append(
-                {
-                    "step": steps,
-                    "unit": current,
-                    "action": action,
-                    "duration_ms": round((end - start) * 1000, 2),
-                    "state_snapshot": store.model_dump(),
-                }
-            )
-
-            # Find next node — handle async fan-out
             next_node = await self._aresolve_next(current, action, store, on_token)
             current = next_node
 
         if steps >= max_steps:
-            logger.warning(
-                "Flow hit max_steps=%d at unit '%s'", max_steps, current
-            )
+            logger.warning("Flow hit max_steps=%d at unit '%s'", max_steps, current)
             if raise_on_exhaust:
                 raise FlowExhaustedError(steps, current)
 
@@ -665,7 +731,7 @@ class Flow(Generic[S]):
                 raise InterruptSignal(w, store, current)
             if isinstance(w.target, list):
                 await self._arun_fanout(w.target, store, on_token)
-                return None
+                continue  # fan-out done, check next wire for continuation
             return w.target
 
         return None
@@ -758,10 +824,17 @@ class Flow(Generic[S]):
             # Fan-out (parallel) — real concurrent execution
             if isinstance(w.target, list):
                 self._run_fanout(w.target, store)
-                return None  # fan-out terminates this branch
+                continue  # fan-out done, check next wire for continuation
             return w.target
 
         return None  # no matching wire = end of flow
+
+    def _resolve_error_target(self, current: str) -> str | None:
+        """Find a wire with on='error' from the current node."""
+        for w in self._wires.get(current, []):
+            if w.on == "error":
+                return w.target if isinstance(w.target, str) else None
+        return None
 
     def _run_fanout(self, targets: list[str], store: S) -> None:
         """Run fan-out targets concurrently using ThreadPoolExecutor with reducer-based merge."""

@@ -30,9 +30,7 @@ from flowforge import (
     StoreBase,
     Unit,
 )
-from flowforge.harness import Agent, AsyncLLMUnit, Team
-from flowforge.identity import Persona, Task
-
+from flowforge.harness import Agent, Team
 
 # ═══════════════════════════════════════════════════════════
 # Shared test state models (contracts)
@@ -502,7 +500,7 @@ class TestB7HierarchicalCompile:
         assert "worker1" in flow.nodes
         assert "worker2" in flow.nodes
 
-        decompose_edges = [(s, t, l) for s, t, l in flow.edges if s == "decompose"]
+        decompose_edges = [(s, t, lbl) for s, t, lbl in flow.edges if s == "decompose"]
         targets = [t for _, t, _ in decompose_edges]
 
         # Workers appear as fan-out targets

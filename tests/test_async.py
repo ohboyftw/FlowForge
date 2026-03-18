@@ -318,3 +318,87 @@ async def test_team_arun_forwards_params():
     # Should complete with generous max_steps
     result = await t.arun("test", max_steps=200, raise_on_exhaust=False)
     assert result is not None
+
+
+# ═══════════════════════════════════════════════════════════
+# Async fan-out continuation + error routing + timeout
+# ═══════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_async_fanout_continuation():
+    """Async fan-out continues to next wire after merge."""
+    flow = Flow()
+    flow.add("dispatch", FunctionUnit(lambda s: "default"))
+    flow.add("a", SimpleAsyncUnit("a"))
+    flow.add("b", SimpleAsyncUnit("b"))
+    flow.add("final", FunctionUnit(lambda s: setattr(s, "output", "done") or "default"))
+
+    flow.wire("dispatch", ["a", "b"])
+    flow.wire("dispatch", "final")
+    flow.entry("dispatch")
+
+    state = AsyncState(task="continue")
+    await flow.arun(state)
+    assert state.output == "done"
+
+
+@pytest.mark.asyncio
+async def test_async_unit_timeout():
+    """AsyncUnit timeout via asyncio.wait_for."""
+
+    class SlowAsyncUnit(AsyncUnit):
+        timeout = 0.1
+
+        async def exec(self, _):
+            await asyncio.sleep(2.0)
+            return "done"
+
+        def post(self, store, result):
+            store.output = result
+            return "default"
+
+    class AsyncErrorHandler(AsyncUnit):
+        async def exec(self, _):
+            return "handled"
+
+        def post(self, store, _):
+            store.output = "timeout_handled"
+            return "default"
+
+    flow = Flow()
+    flow.add("slow", SlowAsyncUnit())
+    flow.add("handler", AsyncErrorHandler())
+    flow.wire("slow", "handler", on="error")
+    flow.entry("slow")
+
+    state = AsyncState(task="timeout")
+    await flow.arun(state)
+    assert state.output == "timeout_handled"
+
+
+@pytest.mark.asyncio
+async def test_async_error_routing():
+    """Error routing works in arun path."""
+
+    class AsyncFailUnit(AsyncUnit):
+        async def exec(self, _):
+            raise ValueError("async boom")
+
+    class AsyncHandlerUnit(AsyncUnit):
+        async def exec(self, _):
+            return "handled"
+
+        def post(self, store, _):
+            store.output = "error_handled"
+            return "default"
+
+    flow = Flow()
+    flow.add("fail", AsyncFailUnit())
+    flow.add("handler", AsyncHandlerUnit())
+    flow.wire("fail", "handler", on="error")
+    flow.entry("fail")
+
+    state = AsyncState(task="error")
+    await flow.arun(state)
+    assert state.output == "error_handled"
