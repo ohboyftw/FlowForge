@@ -58,6 +58,8 @@ def _validate_graph(self) -> None:
 
 Called at the top of `run()` and `arun()`, before the execution loop. Construction-time methods (`wire()`, `add()`, `entry()`) remain permissive — users can wire before adding nodes.
 
+**Breaking change**: Remove the existing eager validation in `entry()` (`if name not in self._units: raise ValueError`) — this contradicts lazy validation. The check moves to `_validate_graph()`.
+
 ### DESIGN-007: max_steps warning + opt-in raise
 
 Add `FlowExhaustedError` exception class:
@@ -79,7 +81,7 @@ if steps >= max_steps:
         raise FlowExhaustedError(steps, current)
 ```
 
-Add `import logging` and `logger = logging.getLogger(__name__)` to `core.py`.
+Add `import logging`, `import time`, and `logger = logging.getLogger(__name__)` to `core.py`. (`time` is needed for FEAT-004 timing; it is not currently imported in `core.py`.)
 
 Export `FlowExhaustedError` from `__init__.py`.
 
@@ -97,7 +99,7 @@ Wrap unit execution with `time.monotonic()` in both `run()` and `arun()`. The tr
 }
 ```
 
-`time` is already imported. No new classes, no logging, no hooks — just data in the existing trace list. A future `Flow.stats()` method can aggregate from `_trace` without any changes to this structure.
+`import time` is added in DESIGN-007 above. No new classes, no logging, no hooks — just data in the existing trace list. A future `Flow.stats()` method can aggregate from `_trace` without any changes to this structure.
 
 ---
 
@@ -161,7 +163,14 @@ else:
 Add to `Team`:
 
 ```python
-async def arun(self, task_desc: str, *, store: StoreBase = None) -> StoreBase:
+async def arun(
+    self,
+    task_desc: str,
+    *,
+    store: StoreBase = None,
+    max_steps: int = 100,
+    raise_on_exhaust: bool = False,
+) -> StoreBase:
     """Async execution. Mirrors run() but uses flow.arun()."""
     flow = self.compile(task_desc)
     if store is None:
@@ -169,10 +178,10 @@ async def arun(self, task_desc: str, *, store: StoreBase = None) -> StoreBase:
             store = self.store_class(task=task_desc)
         else:
             store = FlexStore(task=task_desc)
-    return await flow.arun(store)
+    return await flow.arun(store, max_steps=max_steps, raise_on_exhaust=raise_on_exhaust)
 ```
 
-No streaming passthrough — streaming is a Flow-layer concern. Users who need `on_token` drop to `team.graph` and call `flow.arun(store, on_token=cb)` directly.
+Forwards `max_steps` and `raise_on_exhaust` to `flow.arun()` for parity. No streaming passthrough — streaming is a Flow-layer concern. Users who need `on_token` drop to `team.graph` and call `flow.arun(store, on_token=cb)` directly.
 
 ---
 
@@ -240,15 +249,21 @@ effective = getattr(unit, 'timeout', None) or default_timeout
 
 ```python
 if effective is not None:
+    store_copy = store.model_copy(deep=True)
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(unit.run, store)
+        future = pool.submit(unit.run, store_copy)
         try:
             action = future.result(timeout=effective)
+            # Copy results back to original store on success
+            for field_name in store.__class__.model_fields:
+                setattr(store, field_name, getattr(store_copy, field_name))
         except TimeoutError:
-            raise  # will be caught by error routing
+            raise  # will be caught by error routing; store unchanged
 else:
     action = unit.run(store)
 ```
+
+**Note**: The sync timeout runs on a deep copy to prevent data races — if the thread continues after timeout, it mutates the copy, not the original store. On success, results are copied back.
 
 **Async path** (`Flow.arun`):
 
@@ -258,6 +273,8 @@ if effective is not None:
 else:
     action = await unit.arun(store)
 ```
+
+The async path doesn't need the copy trick — `asyncio.wait_for` cancels the coroutine cleanly.
 
 If no timeout is configured (both `None`), no wrapping — zero overhead on the happy path. `TimeoutError` feeds into the error routing system (FEAT-010).
 
@@ -281,9 +298,12 @@ while current and steps < max_steps:
         raise RuntimeError(f"Unknown unit '{current}'")
 
     start = time.monotonic()
+    object.__setattr__(store, '_last_error', None)  # clear from previous iteration
     try:
         # timeout wrapping here (FEAT-005)
         action = unit.run(store)
+    except InterruptSignal:
+        raise  # interrupts are not errors — propagate to caller
     except Exception as exc:
         end = time.monotonic()
         object.__setattr__(store, '_last_error', exc)
@@ -326,7 +346,56 @@ def _resolve_error_target(self, current: str) -> str | None:
 
 The error handler node receives a store with `_last_error` set (via `object.__setattr__` to bypass Pydantic's `extra="forbid"`). Its `post()` return value drives normal wire routing — the flow can continue or end as usual.
 
-**`_last_error` lifecycle**: Set on error, cleared when the error handler node runs successfully (at the start of the next iteration, before `unit.run()`). Add `object.__setattr__(store, '_last_error', None)` at the top of the loop.
+**`_last_error` lifecycle**: Set on error, cleared at the top of the next loop iteration (already shown in the code above). Error handler units access it via `store._last_error` — this is a private Pydantic attribute, not a model field, so it won't appear in `model_dump()` or interfere with validation.
+
+**`_aresolve_next` update** (mirrors the sync change):
+
+```python
+async def _aresolve_next(self, current, action, store, on_token=None):
+    wires = self._wires.get(current, [])
+    for w in wires:
+        if w.on != action and w.on != "*":
+            continue
+        if w.when is not None and not w.when(store):
+            continue
+        if w.interrupt:
+            raise InterruptSignal(w, store, current)
+        if isinstance(w.target, list):
+            await self._arun_fanout(w.target, store, on_token)
+            continue  # <-- was: return None
+        return w.target
+    return None
+```
+
+### Consensus strategy fix
+
+DESIGN-006 changes fan-out semantics: fan-out no longer terminates the branch. This breaks `_build_consensus`, which currently builds on `_build_parallel` (fan-out from `dispatch → [workers]`) and adds `worker → consensus` wires. But workers run inside `_run_fanout`, not the main loop, so those per-worker wires are never reached.
+
+**Fix**: Add a continuation wire from `dispatch` to `consensus` (same pattern as hierarchical):
+
+```python
+def _build_consensus(self, task_desc: str = "") -> Flow:
+    flow = self._build_parallel(task_desc)
+
+    def consensus_fn(store):
+        outputs = {}
+        for agent in self.agents:
+            val = getattr(store, agent.name, None)
+            if val:
+                outputs[agent.name] = val
+        if hasattr(store, "consensus_inputs"):
+            store.consensus_inputs = outputs
+        return "default"
+
+    flow.add("consensus", FunctionUnit(consensus_fn))
+
+    # Continuation wire from dispatch → consensus (after fan-out completes)
+    flow.wire("dispatch", "consensus")
+
+    return flow
+```
+
+The per-worker `flow.wire(agent.name, "consensus")` lines are removed.
 
 ---
 
@@ -405,16 +474,21 @@ Each group gets its own test additions in `tests/test_flowforge.py` or dedicated
 **Group 3**:
 - `test_fanout_continuation` — fan-out → merge → next node runs
 - `test_fanout_boundary` — verify downstream node sees merged state
+- `test_multiple_fanout_wires` — two fan-out wires on same node, both run sequentially with barrier semantics
 - `test_unit_timeout_sync` — unit with timeout, exceeds it, `TimeoutError` raised
 - `test_unit_timeout_async` — same, async path
 - `test_default_timeout_flow` — flow-level default applies to units without explicit timeout
 - `test_error_routing_wire_level` — unit raises, routes to error handler via `on="error"` wire
 - `test_error_routing_flow_level` — no wire-level route, falls back to `on_error` handler
 - `test_error_routing_preserves_reraise` — no routing configured, original exception propagates
-- `test_last_error_on_store` — error handler can read `_last_error` from store
+- `test_error_routing_does_not_catch_interrupt` — `InterruptSignal` propagates past error routing
+- `test_last_error_on_store` — error handler can read `store._last_error`
+- `test_last_error_cleared_on_next_unit` — `_last_error` is `None` after successful unit execution
 
 **Group 4**:
-- `test_hierarchical_parallel_execution` — workers run in parallel (timing assertion), synthesize sees all outputs
+- `test_hierarchical_parallel_execution` — workers run in parallel (timing with generous tolerance for CI), synthesize sees all outputs
+- `test_hierarchical_edges_structure` — verify compiled flow edges match fan-out + continuation pattern
+- `test_consensus_runs_to_completion` — consensus strategy with new fan-out semantics reaches consensus node
 
 ---
 
