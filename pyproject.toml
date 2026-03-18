@@ -57,10 +57,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ohboyconsultancy/flowforge"
-Documentation = "https://github.com/ohboyconsultancy/flowforge#readme"
-Repository = "https://github.com/ohboyconsultancy/flowforge"
-Issues = "https://github.com/ohboyconsultancy/flowforge/issues"
+Homepage = "https://github.com/ohboyftw/FlowForge"
+Documentation = "https://github.com/ohboyftw/FlowForge#readme"
+Repository = "https://github.com/ohboyftw/FlowForge"
+Issues = "https://github.com/ohboyftw/FlowForge/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/flowforge"]

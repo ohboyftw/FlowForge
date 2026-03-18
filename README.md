@@ -1,25 +1,38 @@
-# FlowForge
+```
+    _____ _               _____
+   |  ___| | _____      _|  ___|__  _ __ __ _  ___
+   | |_  | |/ _ \ \ /\ / / |_ / _ \| '__/ _` |/ _ \
+   |  _| | | (_) \ V  V /|  _| (_) | | | (_| |  __/
+   |_|   |_|\___/ \_/\_/ |_|  \___/|_|  \__, |\___|
+                                         |___/
+```
 
-**Unified agent orchestration in ~250 lines of core Python.**
+**Unified agent orchestration in ~800 lines of Python.**
 
-FlowForge combines the best ideas from PocketFlow, LangGraph, CrewAI, and Agno into a single, layered framework where each layer is independently useful and compiles down to the one below.
+PocketFlow's graph primitives + LangGraph's state machines + CrewAI's roles + Agno's ergonomics — one framework, progressive disclosure.
+
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Pydantic v2](https://img.shields.io/badge/pydantic-v2-E92063.svg)](https://docs.pydantic.dev/)
+[![Tests](https://img.shields.io/badge/tests-58%20passing-brightgreen.svg)](#testing)
+
+---
 
 ```python
-# One-liner — Agno-grade simplicity
-agent = Agent("Researcher", "Find papers on LLM agents", model="claude-sonnet-4-20250514")
-result = agent.run("What's new in agentic AI?")
+from flowforge import Agent, Team, Flow, StoreBase
 
-# Team — CrewAI-grade roles
-team = Team([researcher, coder, reviewer], strategy="sequential")
-team.run("Build a CLI tool")
+# One-liner
+result = Agent("Researcher", "Find papers on LLM agents").run("What's new?")
 
-# Custom graph — LangGraph-grade control
-flow = Flow[MyState]()
-flow.add("research", ResearchUnit())
-flow.add("code", CodeUnit())
-flow.wire("research", "code", when=lambda s: s.has_data)
-flow.entry("research")
-flow.run(MyState(query="test"))
+# Team of agents
+team = Team([researcher, writer, editor], strategy="sequential")
+team.run("Write a report on AI agents")
+
+# Full graph control
+flow = Flow()
+flow.add("research", ResearchUnit()).add("write", WriteUnit())
+flow.wire("research", "write", when=lambda s: s.has_data)
+flow.entry("research").run(MyState())
 ```
 
 ## Why FlowForge?
@@ -39,48 +52,40 @@ FlowForge's answer: **progressive disclosure**. Start with `Agent("role").run("t
 ## The Layer Cake
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  ERGONOMIC LAYER — Agent(), Team(), .run()           │  ← Start here
-│  Developer-facing API (Agno philosophy)              │
-├─────────────────────────────────────────────────────┤
-│  ORCHESTRATION LAYER — Flow, Wire, conditional edges │  ← When you need control
-│  Graph engine (LangGraph power)                      │
-├─────────────────────────────────────────────────────┤
-│  IDENTITY LAYER — Persona, Task, TaskResult          │  ← When you need roles
-│  Role system (CrewAI semantics)                      │
-├─────────────────────────────────────────────────────┤
-│  PRIMITIVE LAYER — Unit, StoreBase(Pydantic), Flow   │  ← When you need everything
-│  Core graph + typed state (PocketFlow minimal)       │
-└─────────────────────────────────────────────────────┘
+  ╔═══════════════════════════════════════════════════════╗
+  ║  HARNESS LAYER         Agent(), Team(), .run()        ║  ← start here
+  ║  · Agno-style ergonomics                              ║
+  ╠═══════════════════════════════════════════════════════╣
+  ║  IDENTITY LAYER        Persona, Task, TaskResult      ║  ← when you need roles
+  ║  · CrewAI-style semantics                             ║
+  ╠═══════════════════════════════════════════════════════╣
+  ║  PRIMITIVE LAYER       Unit, Wire, Flow, StoreBase    ║  ← when you need control
+  ║  · PocketFlow + LangGraph power                       ║
+  ╚═══════════════════════════════════════════════════════╝
+         ▲ each layer compiles down to the one below
 ```
-
-## 5 Primitives, Zero More
-
-| Primitive | From | Purpose |
-|-----------|------|---------|
-| **Unit** | PocketFlow Node | Atomic computation: `prep → exec → post` lifecycle |
-| **Wire** | LangGraph Edge | Typed connection with conditions, interrupts, fan-out |
-| **Persona** | CrewAI Agent | Role/goal/backstory identity → compiles to system prompt |
-| **StoreBase** | Pydantic BaseModel | Typed shared state with validation, checkpoints, rollback |
-| **Harness** | Agno Agent/Team | Ergonomic entry point that auto-wires everything |
 
 ## Installation
 
 ```bash
-# From source (recommended during early development)
-git clone https://github.com/ohboyconsultancy/flowforge.git
-cd flowforge
-pip install -e ".[dev]"
-
-# Or just pip
 pip install flowforge
 ```
 
-**Only dependency**: `pydantic>=2.0`
+Or from source:
+
+```bash
+git clone https://github.com/ohboyftw/FlowForge.git
+cd FlowForge
+pip install -e ".[dev]"
+```
+
+**Only hard dependency**: `pydantic>=2.0`
+
+**Optional** (for real LLM calls): `pip install flowforge[litellm]` or `flowforge[anthropic]` or `flowforge[openai]`
 
 ## Quick Start
 
-### 1. Define Your State (Pydantic all the way down)
+### 1. Define Your State
 
 ```python
 from flowforge import StoreBase
@@ -93,9 +98,9 @@ class ResearchState(StoreBase):
     approved: bool = False
 ```
 
-The Store validates on every mutation, catches typos (`extra="forbid"`), serializes to JSON for checkpoints, and provides schema introspection.
+Validates on every mutation. Catches typos (`extra="forbid"`). Serializes to JSON. Supports checkpoints and rollback.
 
-### 2. One Agent (simplest)
+### 2. Single Agent
 
 ```python
 from flowforge import Agent
@@ -106,7 +111,7 @@ researcher = Agent(
     backstory="PhD in ML, 10 years at DeepMind",
     model="claude-sonnet-4-20250514",
 )
-result = researcher.run("What are the best agent frameworks in 2025?")
+result = researcher.run("What are the best agent frameworks?")
 ```
 
 ### 3. Team of Agents
@@ -118,17 +123,13 @@ researcher = Agent("Researcher", "Find information", llm_fn=my_llm)
 writer = Agent("Writer", "Create reports", llm_fn=my_llm)
 editor = Agent("Editor", "Polish content", llm_fn=my_llm)
 
-# Sequential pipeline
 team = Team([researcher, writer, editor], strategy="sequential")
 result = team.run("Write a report on AI agents")
-
-# Or hierarchical with a manager
-team = Team([researcher, writer], strategy="hierarchical", manager=manager)
 ```
 
-**Strategies**: `sequential`, `parallel`, `hierarchical`, `consensus`
+**Strategies**: `sequential` | `parallel` | `hierarchical` | `consensus`
 
-### 4. Custom Graph (full control)
+### 4. Custom Graph
 
 ```python
 from flowforge import Flow, Unit, StoreBase
@@ -138,20 +139,20 @@ class MyState(StoreBase):
     done: bool = False
 
 class IncrementUnit(Unit):
-    def prep(self, store: MyState):
+    def prep(self, store):
         return store.count
-    def exec(self, count: int) -> int:
+    def exec(self, count):
         return count + 1
-    def post(self, store: MyState, result: int) -> str:
+    def post(self, store, result):
         store.count = result
         return "continue" if result < 5 else "done"
 
 flow = Flow()
-flow.add("increment", IncrementUnit())
+flow.add("inc", IncrementUnit())
 flow.add("finish", FunctionUnit(lambda s: setattr(s, 'done', True) or "default"))
-flow.wire("increment", "increment", on="continue")  # loop!
-flow.wire("increment", "finish", on="done")
-flow.entry("increment")
+flow.wire("inc", "inc", on="continue")   # self-loop
+flow.wire("inc", "finish", on="done")
+flow.entry("inc")
 
 state = MyState()
 flow.run(state)
@@ -163,56 +164,92 @@ assert state.count == 5
 ```python
 from flowforge import Flow, InterruptSignal
 
-flow.wire("analyze", "execute",
-          interrupt=True)  # ← Pauses here
+flow.wire("analyze", "execute", interrupt=True)  # pauses here
 
 try:
     flow.run(state)
 except InterruptSignal as sig:
-    # Show state to human for review
-    print(f"Pending action: {sig.store.proposed_action}")
-    # Human approves...
-    flow.resume(sig.store, from_node="execute")
+    print(f"Pending: {sig.store.proposed_action}")
+    flow.resume(sig.store, from_node="execute")  # human approves
+```
+
+### 6. Async
+
+```python
+from flowforge import AsyncUnit, Flow
+
+class FetchUnit(AsyncUnit):
+    async def exec(self, url):
+        async with aiohttp.ClientSession() as s:
+            return await (await s.get(url)).text()
+
+await flow.run_async(state)
+```
+
+## 5 Primitives, Zero More
+
+```
+  Unit ─────── Atomic computation: prep() → exec() → post()
+  Wire ─────── Typed edge with conditions, interrupts, fan-out
+  Persona ──── Role / goal / backstory → compiles to system prompt
+  StoreBase ── Pydantic-typed shared state with checkpoints
+  Harness ──── Agent() / Team() — ergonomic entry points
 ```
 
 ## Examples
 
-Each example runs standalone with mock LLMs (no API keys needed):
-
-| # | Example | Pattern | Shows |
-|---|---------|---------|-------|
-| 01 | [Research & Report](examples/01_research_report.py) | Pipeline | 3 abstraction levels side-by-side |
-| 02 | [Customer Support](examples/02_customer_support.py) | Router | Triage → specialists, human-in-loop |
-| 03 | [Content Pipeline](examples/03_content_pipeline.py) | Pipeline + Loop | Research → draft → edit → SEO with revision |
-| 04 | [Stock Analysis](examples/04_stock_analysis.py) | Fan-out/Fan-in | Parallel specialists → synthesis |
-| 05 | [Tango Code Review](examples/05_tango_review.py) | Cross-pollination | Dual reviewers with consensus |
+All examples run standalone with mock LLMs — no API keys needed:
 
 ```bash
-# Run any example
 python examples/01_research_report.py
-python examples/02_customer_support.py
 ```
+
+| # | Example | Pattern | What It Shows |
+|---|---------|---------|---------------|
+| 01 | [Research & Report](examples/01_research_report.py) | Pipeline | 3 abstraction levels side-by-side |
+| 02 | [Customer Support](examples/02_customer_support.py) | Router | Triage → specialists, human-in-loop |
+| 03 | [Content Pipeline](examples/03_content_pipeline.py) | Pipeline + Loop | Research → draft → edit → SEO with revision loop |
+| 04 | [Stock Analysis](examples/04_stock_analysis.py) | Fan-out / Fan-in | Parallel specialists → synthesis |
+| 05 | [Tango Code Review](examples/05_tango_review.py) | Cross-pollination | Dual reviewers with consensus |
+| 06 | [Prompt Chaining](examples/06_prompt_chaining.py) | Chain | Outline → draft → edit pipeline |
+| 07 | [Parallelization](examples/07_parallelization.py) | Parallel | 3 analysts with reducer-merged results |
+| 08 | [Orchestrator-Workers](examples/08_orchestrator_workers.py) | Hierarchical | Manager decomposes, workers execute |
+| 09 | [Evaluator-Optimizer](examples/09_evaluator_optimizer.py) | Loop | Generate → evaluate → refine cycle |
+| 10 | [YoExecute Orchestrator](examples/10_yoexecute_orchestrator.py) | Real-world | Autonomous PM workflow |
 
 ## Using with Real LLMs
 
-FlowForge is model-agnostic. Pass any `(system, user, tools) -> str` callable:
+FlowForge is model-agnostic. Pass any `(system, user, tools?) -> str` callable:
 
 ```python
-# With LiteLLM (any provider)
+# LiteLLM — any provider
 import litellm
 def my_llm(system, user, tools=None):
     resp = litellm.completion(
         model="claude-sonnet-4-20250514",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
     )
     return resp.choices[0].message.content
 
 agent = Agent("Researcher", "Find data", llm_fn=my_llm)
+```
 
-# With OpenAI directly
+```python
+# Anthropic direct
+import anthropic
+client = anthropic.Anthropic()
+def claude_llm(system, user, tools=None):
+    resp = client.messages.create(
+        model="claude-sonnet-4-20250514", max_tokens=4096,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    )
+    return resp.content[0].text
+```
+
+```python
+# OpenAI direct
 from openai import OpenAI
 client = OpenAI()
 def openai_llm(system, user, tools=None):
@@ -222,43 +259,43 @@ def openai_llm(system, user, tools=None):
                   {"role": "user", "content": user}],
     )
     return resp.choices[0].message.content
-
-# With Anthropic directly
-import anthropic
-client = anthropic.Anthropic()
-def claude_llm(system, user, tools=None):
-    resp = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return resp.content[0].text
 ```
 
 ## Escape Hatches
 
-Every upper layer exposes the layer below:
+Every upper layer exposes the layer below — no black boxes:
 
 ```python
 # Team → compiled Flow
 team = Team([agent1, agent2], strategy="sequential")
-graph = team.graph                    # Access the Flow
-graph.wire("agent2", "agent1",        # Add custom wire
-           on="retry",
-           when=lambda s: s.score < 0.8)
+graph = team.graph                         # access the Flow
+graph.wire("agent2", "agent1",             # add custom wiring
+           on="retry", when=lambda s: s.score < 0.8)
 
 # Agent → underlying Unit
-unit = agent.as_unit(task)            # Get the LLMUnit
-flow.add("custom_node", unit)         # Use in manual Flow
+unit = agent.as_unit(task)                 # get the LLMUnit
+flow.add("custom_node", unit)              # use in manual Flow
 
 # Persona → system prompt
-print(agent.persona.to_prompt())      # See what the LLM receives
+print(agent.persona.to_prompt())           # see what the LLM gets
 
 # Store → JSON / dict
-state.checkpoint("before_risky_op")   # Save state
-json_str = state.to_json()            # Serialize
-state.rollback("before_risky_op")     # Restore
+state.checkpoint("before_risky_op")        # save state
+state.rollback("before_risky_op")          # restore
+json_str = state.to_json()                 # serialize
+```
+
+## Architecture
+
+```
+src/flowforge/
+├── __init__.py      Public API exports
+├── core.py          StoreBase, Unit, AsyncUnit, Wire, Flow    (812 lines)
+├── identity.py      Persona, Task, TaskResult                 (228 lines)
+└── harness.py       Agent, Team, LLMUnit, AsyncLLMUnit        (576 lines)
+
+examples/            10 runnable patterns (mock LLMs, no keys)
+tests/               58 tests across 5 test files
 ```
 
 ## Design Principles
@@ -268,41 +305,16 @@ state.rollback("before_risky_op")     # Restore
 3. **Compilation model** — upper layers compile to lower layers, never magic
 4. **Intentional leakiness** — escape hatches at every boundary, not accidental leaks
 5. **Model agnostic** — `llm_fn` is just a callable, use any provider
-6. **Zero framework lock-in** — only dependency is Pydantic
+6. **Zero framework lock-in** — only hard dependency is Pydantic
 
-## Development
+## Testing
 
 ```bash
-# Clone and install
-git clone https://github.com/ohboyconsultancy/flowforge.git
-cd flowforge
 pip install -e ".[dev]"
-
-# Run tests
 python -m pytest tests/ -v
-
-# Run all examples
-python examples/01_research_report.py
-python examples/02_customer_support.py
-python examples/03_content_pipeline.py
-python examples/04_stock_analysis.py
-python examples/05_tango_review.py
 ```
 
-## Architecture
-
-```
-src/flowforge/
-├── __init__.py          # Public API exports
-├── core.py              # StoreBase, Unit, Wire, Flow (~250 lines)
-├── identity.py          # Persona, Task, TaskResult (~120 lines)
-└── harness.py           # Agent, Team, LLMUnit (~200 lines)
-
-examples/                # 5 canonical patterns, all runnable
-tests/                   # 28 tests covering all layers
-```
-
-Total core: **~570 lines**. Only dependency: **Pydantic**.
+58 tests covering all layers: primitives, identity, harness, async, strategies, and smoke tests.
 
 ## License
 
@@ -311,9 +323,10 @@ MIT
 ## Credits
 
 FlowForge stands on the shoulders of:
+
 - [PocketFlow](https://github.com/The-Pocket/PocketFlow) — the 100-line graph insight
 - [LangGraph](https://github.com/langchain-ai/langgraph) — state machines for agents
 - [CrewAI](https://github.com/crewAIInc/crewAI) — role-based collaboration
 - [Agno](https://github.com/agno-agi/agno) — ergonomic, fast agent framework
 
-Built by [OhboyConsultancy FZ LLC](https://ohboyconsultancy.com) — AI consulting for the Gulf region and India.
+Built by [Aravind](https://github.com/ohboyftw)
