@@ -13,6 +13,8 @@ Design: Store is a Pydantic BaseModel subclass, giving us:
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -25,6 +27,8 @@ from typing import (
 )
 
 from pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger(__name__)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # STORE — Pydantic-typed shared state with checkpointing
@@ -240,6 +244,15 @@ class ReducerRegistry:
 S = TypeVar("S", bound=StoreBase)
 
 
+class FlowExhaustedError(Exception):
+    """Raised when Flow.run() hits the max_steps limit."""
+
+    def __init__(self, steps: int, last_unit: str):
+        self.steps = steps
+        self.last_unit = last_unit
+        super().__init__(f"Flow exhausted after {steps} steps at unit '{last_unit}'")
+
+
 class Unit(Generic[S]):
     """
     Atomic computation with prep → exec → post lifecycle.
@@ -292,7 +305,6 @@ class Unit(Generic[S]):
                 last_error = exc
                 if attempt == self.max_retries:
                     return self.exec_fallback(prep_result, exc)
-        raise last_error  # unreachable but satisfies type checker
 
 
 class AsyncUnit(Generic[S]):
@@ -330,7 +342,6 @@ class AsyncUnit(Generic[S]):
                 last_error = exc
                 if attempt == self.max_retries:
                     return await self.exec_fallback(prep_result, exc)
-        raise last_error  # unreachable
 
 
 class FunctionUnit(Unit[S]):
@@ -426,6 +437,25 @@ class _CountingWrapper(Unit):
         return self._inner.post(store, exec_result)
 
 
+class _AsyncCountingWrapper(AsyncUnit):
+    """Wraps an AsyncUnit to count executions for loop() termination."""
+
+    def __init__(self, inner: AsyncUnit, counter: list[int]):
+        self._inner = inner
+        self._counter = counter
+        self.max_retries = getattr(inner, "max_retries", 0)
+
+    def prep(self, store):
+        return self._inner.prep(store)
+
+    async def exec(self, prep_result):
+        return await self._inner.exec(prep_result)
+
+    def post(self, store, exec_result):
+        self._counter[0] += 1
+        return self._inner.post(store, exec_result)
+
+
 class InterruptSignal(Exception):  # noqa: N818 — Signal, not Error
     """Raised when a Wire with interrupt=True is traversed."""
 
@@ -487,23 +517,40 @@ class Flow(Generic[S]):
         return self
 
     def entry(self, name: str) -> Flow[S]:
-        """Set the entry point node."""
-        if name not in self._units:
-            raise ValueError(f"Unknown unit '{name}'")
+        """Set the entry point node. Validated lazily at run time."""
         self._entry = name
         return self
 
+    def _validate_graph(self) -> None:
+        """Validate all wire targets reference registered units. Called at run time."""
+        errors = []
+        for src, wires in self._wires.items():
+            if src not in self._units:
+                errors.append(f"Wire source '{src}' is not a registered unit")
+            for w in wires:
+                targets = w.target if isinstance(w.target, list) else [w.target]
+                for t in targets:
+                    if t not in self._units:
+                        errors.append(
+                            f"Wire target '{t}' (from '{src}') is not a registered unit"
+                        )
+        if not self._entry:
+            errors.append("No entry point set")
+        elif self._entry not in self._units:
+            errors.append(f"Entry point '{self._entry}' is not a registered unit")
+        if errors:
+            raise ValueError("Invalid flow graph:\n  " + "\n  ".join(errors))
+
     # ── Execution ──
 
-    def run(self, store: S, *, max_steps: int = 100) -> S:
+    def run(self, store: S, *, max_steps: int = 100, raise_on_exhaust: bool = False) -> S:
         """
         Execute the flow. Returns the final store state.
 
         Raises InterruptSignal if a human-in-the-loop wire is hit.
         Caller can catch it, inspect store, and resume.
         """
-        if not self._entry:
-            raise RuntimeError("No entry point set. Call flow.entry('name')")
+        self._validate_graph()
 
         self._trace = []
         current = self._entry
@@ -511,17 +558,18 @@ class Flow(Generic[S]):
 
         while current and steps < max_steps:
             steps += 1
-            unit = self._units.get(current)
-            if unit is None:
-                raise RuntimeError(f"Unknown unit '{current}'")
+            unit = self._units[current]
 
             # Execute unit
+            start = time.monotonic()
             action = unit.run(store)
+            end = time.monotonic()
             self._trace.append(
                 {
                     "step": steps,
                     "unit": current,
                     "action": action,
+                    "duration_ms": round((end - start) * 1000, 2),
                     "state_snapshot": store.model_dump(),
                 }
             )
@@ -529,6 +577,13 @@ class Flow(Generic[S]):
             # Find next node
             next_node = self._resolve_next(current, action, store)
             current = next_node
+
+        if steps >= max_steps:
+            logger.warning(
+                "Flow hit max_steps=%d at unit '%s'", max_steps, current
+            )
+            if raise_on_exhaust:
+                raise FlowExhaustedError(steps, current)
 
         return store
 
@@ -542,6 +597,7 @@ class Flow(Generic[S]):
         store: S,
         *,
         max_steps: int = 100,
+        raise_on_exhaust: bool = False,
         on_token: Callable | None = None,
     ) -> S:
         """
@@ -550,8 +606,7 @@ class Flow(Generic[S]):
         For async fan-out uses asyncio.gather() instead of threads.
         Pass on_token callback for streaming support.
         """
-        if not self._entry:
-            raise RuntimeError("No entry point set. Call flow.entry('name')")
+        self._validate_graph()
 
         self._trace = []
         current = self._entry
@@ -559,11 +614,10 @@ class Flow(Generic[S]):
 
         while current and steps < max_steps:
             steps += 1
-            unit = self._units.get(current)
-            if unit is None:
-                raise RuntimeError(f"Unknown unit '{current}'")
+            unit = self._units[current]
 
             # Execute unit — async or sync
+            start = time.monotonic()
             if isinstance(unit, AsyncUnit):
                 # Pass on_token for streaming support
                 if on_token:
@@ -571,12 +625,14 @@ class Flow(Generic[S]):
                 action = await unit.arun(store)
             else:
                 action = unit.run(store)
+            end = time.monotonic()
 
             self._trace.append(
                 {
                     "step": steps,
                     "unit": current,
                     "action": action,
+                    "duration_ms": round((end - start) * 1000, 2),
                     "state_snapshot": store.model_dump(),
                 }
             )
@@ -584,6 +640,13 @@ class Flow(Generic[S]):
             # Find next node — handle async fan-out
             next_node = await self._aresolve_next(current, action, store, on_token)
             current = next_node
+
+        if steps >= max_steps:
+            logger.warning(
+                "Flow hit max_steps=%d at unit '%s'", max_steps, current
+            )
+            if raise_on_exhaust:
+                raise FlowExhaustedError(steps, current)
 
         return store
 
@@ -665,7 +728,10 @@ class Flow(Generic[S]):
         original_unit = self._units.get(evaluator)
         if original_unit is None:
             raise ValueError(f"Unknown unit '{evaluator}'")
-        self._units[evaluator] = _CountingWrapper(original_unit, round_counter)
+        if isinstance(original_unit, AsyncUnit):
+            self._units[evaluator] = _AsyncCountingWrapper(original_unit, round_counter)
+        else:
+            self._units[evaluator] = _CountingWrapper(original_unit, round_counter)
 
         self.wire(generator, evaluator)
         self.wire(evaluator, generator, on="default", when=_check_continue)

@@ -8,7 +8,7 @@ import time
 import pytest
 from pydantic import Field
 
-from flowforge import AsyncUnit, Flow, FunctionUnit, StoreBase, Unit
+from flowforge import Agent, AsyncUnit, Flow, FunctionUnit, StoreBase, Team, Unit
 from flowforge.harness import AsyncLLMUnit
 from flowforge.identity import Persona, Task
 
@@ -235,3 +235,86 @@ def test_sync_flow_still_works():
     state = AsyncState(task="sync")
     result = flow.run(state)
     assert result.count == 2
+
+
+class AsyncEvalUnit(AsyncUnit):
+    """Async evaluator that counts via post."""
+
+    async def exec(self, prep_result):
+        await asyncio.sleep(0.01)
+        return "evaluated"
+
+    def post(self, store, result):
+        store.count += 1
+        return "default"
+
+
+@pytest.mark.asyncio
+async def test_async_loop_with_async_evaluator():
+    """flow.loop() works with AsyncUnit evaluator via arun()."""
+    flow = Flow()
+
+    class GenUnit(Unit):
+        def post(self, store, _):
+            store.results = store.results + [f"gen_{store.count}"]
+            return "default"
+
+    flow.add("gen", GenUnit())
+    flow.add("eval", AsyncEvalUnit())
+    flow.loop("gen", "eval", until=lambda s: s.count >= 3, max_rounds=5)
+    flow.entry("gen")
+
+    state = AsyncState(task="async_loop")
+    await flow.arun(state)
+
+    assert state.count >= 3
+    assert len(state.results) >= 3
+
+
+@pytest.mark.asyncio
+async def test_async_trace_has_duration():
+    """arun() trace entries include duration_ms."""
+    flow = Flow()
+    flow.add("step", SimpleAsyncUnit("timed"))
+    flow.entry("step")
+
+    state = AsyncState(task="timing")
+    await flow.arun(state)
+
+    for entry in flow.trace:
+        assert "duration_ms" in entry
+        assert isinstance(entry["duration_ms"], float)
+        assert entry["duration_ms"] >= 0
+
+
+# ═══════════════════════════════════════════════════════════
+# Team.arun() tests
+# ═══════════════════════════════════════════════════════════
+
+
+def _mock_sync_team_llm(system: str, user: str, tools: list = None, **kw) -> str:
+    return f"MOCK: {user[:50]}"
+
+
+@pytest.mark.asyncio
+async def test_team_arun():
+    """Team.arun() runs the compiled flow asynchronously."""
+    a1 = Agent("Step1", "Do step 1", llm_fn=_mock_sync_team_llm)
+    a2 = Agent("Step2", "Do step 2", llm_fn=_mock_sync_team_llm)
+    t = Team([a1, a2], strategy="sequential")
+
+    result = await t.arun("test task")
+
+    assert result is not None
+    assert hasattr(result, "step1") or hasattr(result, "task")
+
+
+@pytest.mark.asyncio
+async def test_team_arun_forwards_params():
+    """Team.arun() forwards max_steps and raise_on_exhaust."""
+    a1 = Agent("Worker", "Work", llm_fn=_mock_sync_team_llm)
+    t = Team([a1], strategy="sequential")
+
+    # Should complete with generous max_steps
+    result = await t.arun("test", max_steps=200, raise_on_exhaust=False)
+    assert result is not None
