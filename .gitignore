@@ -37,3 +37,11 @@ htmlcov/
 
 # Code graph
 .codegraph/
+
+# Evolution artifacts
+.canopy-agent-instructions.md
+.worktrees/
+.canopy-evolution-state.json
+.canopy-evolution-hints.json
+archive.jsonl
+patches/

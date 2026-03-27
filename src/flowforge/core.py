@@ -13,6 +13,7 @@ Design: Store is a Pydantic BaseModel subclass, giving us:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import Callable
@@ -330,8 +331,13 @@ class AsyncUnit(Generic[S]):
 
     async def arun(self, store: S) -> str:
         p = self.prep(store)
+        if inspect.isawaitable(p):
+            p = await p
         e = await self._exec_with_retry(p)
-        return self.post(store, e)
+        result = self.post(store, e)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     async def _exec_with_retry(self, prep_result: Any) -> Any:
         for attempt in range(self.max_retries + 1):
@@ -416,6 +422,21 @@ def _merge_fanout_results(
             setattr(store, field_name, merged)
 
 
+class _FlowUnit(Unit):
+    """Wraps a Flow as a Unit for composition in another Flow."""
+
+    def __init__(self, flow: Flow):
+        self._flow = flow
+
+    def run(self, store):
+        self._flow.run(store)
+        # Forward the nested flow's last action, or "default" if no trace
+        trace = self._flow.trace
+        if trace:
+            return trace[-1].get("action", "default")
+        return "default"
+
+
 class _CountingWrapper(Unit):
     """Wraps a Unit to count executions for loop() termination."""
 
@@ -493,6 +514,7 @@ class Flow(Generic[S]):
         self._reducers = reducers or ReducerRegistry()
         self._trace: list[dict] = []
         self._on_error = on_error
+        self.callbacks: dict[str, Callable] = {}
 
     # ── Graph construction (fluent API) ──
 
@@ -561,7 +583,13 @@ class Flow(Generic[S]):
             if unit is None:
                 raise RuntimeError(f"Unknown unit '{current}'")
 
+            # Fire on_unit_start callback
+            cb_start = self.callbacks.get("on_unit_start")
+            if cb_start:
+                cb_start(current, store)
+
             start = time.monotonic()
+            action = None
             try:
                 effective_timeout = getattr(unit, "timeout", None) or default_timeout
                 if effective_timeout is not None:
@@ -609,6 +637,11 @@ class Flow(Generic[S]):
                     }
                 )
 
+            # Fire on_unit_end callback
+            cb_end = self.callbacks.get("on_unit_end")
+            if cb_end:
+                cb_end(current, store, action)
+
             next_node = self._resolve_next(current, action, store)
             current = next_node
 
@@ -646,7 +679,15 @@ class Flow(Generic[S]):
             if unit is None:
                 raise RuntimeError(f"Unknown unit '{current}'")
 
+            # Fire on_unit_start callback
+            cb_start = self.callbacks.get("on_unit_start")
+            if cb_start:
+                result = cb_start(current, store)
+                if inspect.isawaitable(result):
+                    await result
+
             start = time.monotonic()
+            action = None
             try:
                 effective_timeout = getattr(unit, "timeout", None) or default_timeout
                 if isinstance(unit, AsyncUnit):
@@ -706,6 +747,13 @@ class Flow(Generic[S]):
                     }
                 )
 
+            # Fire on_unit_end callback
+            cb_end = self.callbacks.get("on_unit_end")
+            if cb_end:
+                result = cb_end(current, store, action)
+                if inspect.isawaitable(result):
+                    await result
+
             next_node = await self._aresolve_next(current, action, store, on_token)
             current = next_node
 
@@ -731,7 +779,7 @@ class Flow(Generic[S]):
                 raise InterruptSignal(w, store, current)
             if isinstance(w.target, list):
                 await self._arun_fanout(w.target, store, on_token)
-                continue  # fan-out done, check next wire for continuation
+                continue
             return w.target
 
         return None
@@ -752,17 +800,34 @@ class Flow(Generic[S]):
         registry = self._build_fanout_registry(store)
         original_values = store.model_dump()
 
-        async def _run_one(unit, store_copy):
+        max_steps = len(self._units) * 2  # cycle protection
+
+        async def _run_one(name, unit, store_copy):
             if isinstance(unit, AsyncUnit):
                 if on_token:
                     unit._on_token = on_token
-                await unit.arun(store_copy)
+                action = await unit.arun(store_copy)
             else:
-                unit.run(store_copy)
+                action = unit.run(store_copy)
+            # Follow downstream wires so nested fan-outs execute
+            next_node = await self._aresolve_next(name, action, store_copy, on_token)
+            steps = 0
+            while next_node:
+                steps += 1
+                if steps > max_steps:
+                    break
+                nunit = self._units.get(next_node)
+                if nunit is None:
+                    break
+                if isinstance(nunit, AsyncUnit):
+                    naction = await nunit.arun(store_copy)
+                else:
+                    naction = nunit.run(store_copy)
+                next_node = await self._aresolve_next(next_node, naction, store_copy, on_token)
             return store_copy.model_dump()
 
-        copies = [(u, store.model_copy(deep=True)) for _name, u in units]
-        results = await asyncio.gather(*[_run_one(u, c) for u, c in copies])
+        copies = [(name, u, store.model_copy(deep=True)) for name, u in units]
+        results = await asyncio.gather(*[_run_one(n, u, c) for n, u, c in copies])
 
         _merge_fanout_results(store, results, original_values, registry)
 
@@ -807,12 +872,16 @@ class Flow(Generic[S]):
         self.wire(evaluator, end_name, on="default", when=_check_done)
         return self
 
+    def as_unit(self) -> Unit:
+        """Wrap this Flow as a Unit for composition in another Flow."""
+        return _FlowUnit(self)
+
     def _resolve_next(self, current: str, action: str, store: S) -> str | None:
         """Resolve the next node based on wires, action label, and conditions."""
         wires = self._wires.get(current, [])
 
         for w in wires:
-            # Match on action label
+            # Match on action label (exact match or wildcard)
             if w.on != action and w.on != "*":
                 continue
             # Check guard condition
@@ -845,14 +914,28 @@ class Flow(Generic[S]):
         registry = self._build_fanout_registry(store)
         original_values = store.model_dump()
 
-        def _run_on_copy(unit: Unit, store_copy: StoreBase) -> dict:
-            unit.run(store_copy)
+        max_steps = len(self._units) * 2  # cycle protection
+
+        def _run_on_copy(name: str, store_copy: StoreBase) -> dict:
+            action = self._units[name].run(store_copy)
+            # Follow downstream wires so nested fan-outs execute
+            next_node = self._resolve_next(name, action, store_copy)
+            steps = 0
+            while next_node:
+                steps += 1
+                if steps > max_steps:
+                    break  # cycle protection
+                nunit = self._units.get(next_node)
+                if nunit is None:
+                    break
+                naction = nunit.run(store_copy)
+                next_node = self._resolve_next(next_node, naction, store_copy)
             return store_copy.model_dump()
 
-        copies = [(u, store.model_copy(deep=True)) for _name, u in units]
+        copies = [(name, store.model_copy(deep=True)) for name, _u in units]
 
         with ThreadPoolExecutor(max_workers=len(copies)) as pool:
-            futures = [pool.submit(_run_on_copy, u, c) for u, c in copies]
+            futures = [pool.submit(_run_on_copy, name, c) for name, c in copies]
             results = [f.result() for f in futures]
 
         _merge_fanout_results(store, results, original_values, registry)
